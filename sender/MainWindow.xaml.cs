@@ -1,213 +1,146 @@
-﻿using System;
-using System.Numerics;
+﻿using sender;
+using SharpDX.Direct3D11;
 using System.Runtime.InteropServices;
-using System.Threading;
 using System.Windows;
-using System.Windows.Interop;
 using System.Windows.Media;
 using System.Windows.Media.Imaging;
-using Windows.Graphics;
-using Windows.Graphics.Capture;
-using Windows.Graphics.DirectX;
 using Windows.Graphics.DirectX.Direct3D11;
-using SharpDX.Direct3D11;
-using SharpDX.DXGI;
-using Device = SharpDX.Direct3D11.Device;
-using MapFlags = SharpDX.Direct3D11.MapFlags;
 using WinRT;
+using Device = SharpDX.Direct3D11.Device;
 
 namespace ScreenCaptureApp
 {
     public partial class MainWindow : Window
     {
-        private GraphicsCaptureItem _captureItem;
-        private Direct3D11CaptureFramePool _framePool;
-        private GraphicsCaptureSession _session;
-        private SizeInt32 _lastSize;
-        private IDirect3DDevice _device;
-        private Device _d3dDevice;
+        private FrameCapturer _capturer;
+        private VideoEncoder _encoder;
+        private WriteableBitmap _previewBitmap;
 
         public MainWindow()
         {
             InitializeComponent();
-            InitializeDirect3D();
+
+            // Create the objects — InitD3D moved into capturer
+            _capturer = new FrameCapturer();
+            _encoder = new VideoEncoder();
+
+            // Wire capturer -> encoder so capturer can forward frames to encoder
+            _capturer.FrameReady += (tex, desc) =>
+            {
+                // Forward to encoder — keep async fire-and-forget like original
+                _encoder.EncodeAndSendFrame(tex, desc, _capturer.MainDevice, _capturer.UdpClient, _capturer.RemoteTarget, this.Dispatcher, UpdateStatusFromEncoder);
+            };
+
+            // Wire encoder -> preview update
+            _encoder.FrameDataReady += (frameData, width, height) =>
+            {
+                UpdatePreview(frameData, width, height);
+            };
+
+            // Initialize D3D + UDP etc (previously InitD3D)
+            _capturer.InitD3D();
+
             Closed += MainWindow_Closed;
         }
 
-        private void InitializeDirect3D()
+        private void InitializePreview(int w, int h)
         {
-            _d3dDevice = new Device(SharpDX.Direct3D.DriverType.Hardware, DeviceCreationFlags.BgraSupport);
-            _device = Direct3D11Helper.CreateDevice(_d3dDevice);
+            Dispatcher.Invoke(() =>
+            {
+                _previewBitmap = new WriteableBitmap(w, h, 96, 96, PixelFormats.Bgra32, null);
+                PreviewImage.Source = _previewBitmap;
+            });
+        }
+
+        private void UpdatePreview(byte[] frameData, int width, int height)
+        {
+            if (_previewBitmap == null)
+            {
+                InitializePreview(width, height);
+            }
+
+            Dispatcher.Invoke(() =>
+            {
+                try
+                {
+                    _previewBitmap.Lock();
+
+                    // Copy frame data to bitmap
+                    int stride = width * 4;
+                    Marshal.Copy(frameData, 0, _previewBitmap.BackBuffer, frameData.Length);
+
+                    _previewBitmap.AddDirtyRect(new Int32Rect(0, 0, width, height));
+                }
+                finally
+                {
+                    _previewBitmap.Unlock();
+                }
+            });
+        }
+
+        // Helper callback to allow encoder to update the StatusText safely
+        private void UpdateStatusFromEncoder(string status)
+        {
+            Dispatcher.Invoke(() => { StatusText.Text = status; });
         }
 
         private async void StartButton_Click(object sender, RoutedEventArgs e)
         {
             try
             {
-                // Use GraphicsCapturePicker for compatibility
-                var picker = new GraphicsCapturePicker();
+                // Delegate the picker and start logic to FrameCapturer.
+                // We pass 'this' so FrameCapturer can initialize the picker with the window handle
+                await _capturer.StartCaptureAsync(this);
 
-                // Get window handle for the picker
-                var hwnd = new WindowInteropHelper(this).Handle;
-                WinRT.Interop.InitializeWithWindow.Initialize(picker, hwnd);
-
-                // Let user select what to capture
-                _captureItem = await picker.PickSingleItemAsync();
-
-                if (_captureItem == null)
+                // Initialize encoder based on capture size (moved logic)
+                var sz = _capturer.LastSize;
+                if (sz.HasValue)
                 {
-                    StatusText.Text = "Capture cancelled";
-                    return;
+                    _encoder.InitializeEncoder(sz.Value.Width, sz.Value.Height, this.Dispatcher, UpdateStatusFromEncoder);
+                    InitializePreview(sz.Value.Width, sz.Value.Height);
                 }
 
-                _lastSize = _captureItem.Size;
-
-                _framePool = Direct3D11CaptureFramePool.CreateFreeThreaded(
-                    _device,
-                    DirectXPixelFormat.B8G8R8A8UIntNormalized,
-                    2,
-                    _captureItem.Size);
-
-                _framePool.FrameArrived += FramePool_FrameArrived;
-
-                _session = _framePool.CreateCaptureSession(_captureItem);
-
-                // Enable cursor capture to show the mouse in the captured frames
-                _session.IsCursorCaptureEnabled = true;
-
-                _session.StartCapture();
-
+                // Update UI (same as original)
                 StartButton.IsEnabled = false;
                 StopButton.IsEnabled = true;
-                StatusText.Text = "Capture started, waiting for frames...";
+
+                StatusText.Text = "Capture started; encoder warming up...";
             }
             catch (Exception ex)
             {
-                MessageBox.Show($"Error starting capture: {ex.Message}\n\nStack: {ex.StackTrace}", "Error", MessageBoxButton.OK, MessageBoxImage.Error);
-                StatusText.Text = "Error";
+                MessageBox.Show($"Something tripped up while starting:\n{ex.Message}", "Oops", MessageBoxButton.OK, MessageBoxImage.Warning);
+                StatusText.Text = "Error starting.";
             }
         }
 
         private void StopButton_Click(object sender, RoutedEventArgs e)
         {
-            StopCapture();
-        }
+            // Stop capture + encoder
+            _capturer.StopCapture();
+            _encoder.DisposeEncoder();
 
-        private void StopCapture()
-        {
-            _session?.Dispose();
-            _session = null;
+            // Clear preview
+            Dispatcher.Invoke(() =>
+            {
+                PreviewImage.Source = null;
+                _previewBitmap = null;
+            });
 
-            _framePool?.Dispose();
-            _framePool = null;
-
+            // Restore UI
             StartButton.IsEnabled = true;
             StopButton.IsEnabled = false;
-            StatusText.Text = "Stopped";
-        }
-
-        private void FramePool_FrameArrived(Direct3D11CaptureFramePool sender, object args)
-        {
-            try
-            {
-                using var frame = sender.TryGetNextFrame();
-                if (frame == null)
-                {
-                    Dispatcher.Invoke(() => StatusText.Text = "Frame is null");
-                    return;
-                }
-
-                var newSize = frame.ContentSize;
-
-                Dispatcher.Invoke(() => StatusText.Text = $"Capturing: {newSize.Width}x{newSize.Height}");
-
-                if (newSize.Width != _lastSize.Width || newSize.Height != _lastSize.Height)
-                {
-                    _lastSize = newSize;
-                    _framePool.Recreate(_device, DirectXPixelFormat.B8G8R8A8UIntNormalized, 2, newSize);
-                    return;
-                }
-
-                using var bitmap = Direct3D11Helper.CreateSharpDXTexture2D(frame.Surface);
-                ProcessFrame(bitmap);
-            }
-            catch (Exception ex)
-            {
-                Dispatcher.Invoke(() =>
-                {
-                    StatusText.Text = $"Frame error: {ex.Message}";
-                    MessageBox.Show($"Frame processing error:\n{ex.Message}\n\nStack:\n{ex.StackTrace}",
-                        "Error", MessageBoxButton.OK, MessageBoxImage.Error);
-                });
-            }
-        }
-
-        private void ProcessFrame(Texture2D texture)
-        {
-            try
-            {
-                var desc = texture.Description;
-                desc.CpuAccessFlags = CpuAccessFlags.Read;
-                desc.Usage = ResourceUsage.Staging;
-                desc.OptionFlags = ResourceOptionFlags.None;
-                desc.BindFlags = BindFlags.None;
-
-                using var stagingTexture = new Texture2D(_d3dDevice, desc);
-                _d3dDevice.ImmediateContext.CopyResource(texture, stagingTexture);
-
-                var dataBox = _d3dDevice.ImmediateContext.MapSubresource(stagingTexture, 0, MapMode.Read, MapFlags.None);
-
-                try
-                {
-                    Dispatcher.Invoke(() =>
-                    {
-                        var bitmap = new WriteableBitmap(desc.Width, desc.Height, 96, 96, PixelFormats.Bgra32, null);
-                        bitmap.Lock();
-
-                        unsafe
-                        {
-                            var src = (byte*)dataBox.DataPointer;
-                            var dst = (byte*)bitmap.BackBuffer;
-                            var stride = desc.Width * 4;
-
-                            for (int y = 0; y < desc.Height; y++)
-                            {
-                                System.Buffer.MemoryCopy(src + y * dataBox.RowPitch, dst + y * stride, stride, stride);
-                            }
-                        }
-
-                        bitmap.AddDirtyRect(new Int32Rect(0, 0, desc.Width, desc.Height));
-                        bitmap.Unlock();
-
-                        CaptureImage.Source = bitmap;
-                        StatusText.Text = $"Displaying: {desc.Width}x{desc.Height}";
-                    });
-                }
-                finally
-                {
-                    _d3dDevice.ImmediateContext.UnmapSubresource(stagingTexture, 0);
-                }
-            }
-            catch (Exception ex)
-            {
-                Dispatcher.Invoke(() =>
-                {
-                    StatusText.Text = $"Process error: {ex.Message}";
-                    MessageBox.Show($"Processing error:\n{ex.Message}\n\nStack:\n{ex.StackTrace}",
-                        "Error", MessageBoxButton.OK, MessageBoxImage.Error);
-                });
-            }
         }
 
         private void MainWindow_Closed(object sender, EventArgs e)
         {
-            StopCapture();
-            _device?.Dispose();
-            _d3dDevice?.Dispose();
+            // Stop everything and dispose
+            _capturer.StopCapture();
+            _capturer.DisposeAll();
+            _encoder.DisposeEncoder();
         }
     }
 
-    // Helper class to bridge Windows.Graphics.DirectX.Direct3D11 and SharpDX
+    // Helper bridging WinRT D3D with SharpDX
     static class Direct3D11Helper
     {
         [ComImport]
@@ -219,79 +152,62 @@ namespace ScreenCaptureApp
         }
 
         [DllImport("d3d11.dll", EntryPoint = "CreateDirect3D11DeviceFromDXGIDevice")]
-        static extern int CreateDirect3D11DeviceFromDXGIDeviceNative(IntPtr dxgiDevice, out IntPtr graphicsDevice);
+        static extern int CreateDirect3D11DeviceFromDXGIDeviceNative(
+            IntPtr dxgiDevice,
+            out IntPtr graphicsDevice);
 
-        public static IDirect3DDevice CreateDevice(Device device)
+        public static IDirect3DDevice CreateDevice(Device dev)
         {
-            using var dxgiDevice = device.QueryInterface<SharpDX.DXGI.Device>();
+            using var dxgi = dev.QueryInterface<SharpDX.DXGI.Device>();
 
-            var hr = CreateDirect3D11DeviceFromDXGIDeviceNative(dxgiDevice.NativePointer, out var pUnknown);
-
-            if (hr != 0)
-            {
-                Marshal.ThrowExceptionForHR(hr);
-            }
+            var hr = CreateDirect3D11DeviceFromDXGIDeviceNative(dxgi.NativePointer, out var unkPtr);
+            if (hr != 0) Marshal.ThrowExceptionForHR(hr);
 
             try
             {
-                var d3dDevice = WinRT.MarshalInterface<IDirect3DDevice>.FromAbi(pUnknown);
-                return d3dDevice;
+                return WinRT.MarshalInterface<IDirect3DDevice>.FromAbi(unkPtr);
             }
             finally
             {
-                Marshal.Release(pUnknown);
+                Marshal.Release(unkPtr);
             }
         }
 
-        public static Texture2D CreateSharpDXTexture2D(IDirect3DSurface surface)
+        public static Texture2D CreateSharpDXTexture2D(IDirect3DSurface surf)
         {
-            // Use WinRT's native interop to get the underlying COM pointer
-            var surfaceNative = surface as IWinRTObject;
-            if (surfaceNative == null)
-            {
-                throw new InvalidOperationException("Surface does not implement IWinRTObject");
-            }
+            var wrtObj = surf as IWinRTObject;
+            if (wrtObj == null)
+                throw new InvalidOperationException("Surface missing IWinRTObject");
 
-            // Get the native object reference
-            var objRef = surfaceNative.NativeObject;
-            var thisPtr = objRef.ThisPtr;
+            var objRef = wrtObj.NativeObject;
+            var ptr = objRef.ThisPtr;
 
-            // Query for the actual IDirect3DDxgiInterfaceAccess interface
-            var accessGuid = new Guid("A9B3D012-3DF2-4EE3-B8D1-8695F457D3C1");
-            var hr = Marshal.QueryInterface(thisPtr, ref accessGuid, out IntPtr accessPtr);
+            var accGuid = new Guid("A9B3D012-3DF2-4EE3-B8D1-8695F457D3C1");
 
+            var hr = Marshal.QueryInterface(ptr, ref accGuid, out IntPtr accPtr);
             if (hr != 0)
-            {
-                throw new COMException($"Failed to QueryInterface for IDirect3DDxgiInterfaceAccess. HRESULT: 0x{hr:X8}", hr);
-            }
+                throw new COMException($"QueryInterface failed: 0x{hr:X8}", hr);
 
             try
             {
-                // IDirect3DDxgiInterfaceAccess has only one method: GetInterface
-                // It's at vtable offset 3 (after IUnknown's 3 methods: QueryInterface, AddRef, Release)
-                var vtbl = Marshal.ReadIntPtr(accessPtr);
-                var getInterfacePtr = Marshal.ReadIntPtr(vtbl, 3 * IntPtr.Size);
+                var vtbl = Marshal.ReadIntPtr(accPtr);
+                var funcPtr = Marshal.ReadIntPtr(vtbl, 3 * IntPtr.Size);
 
-                var getInterface = Marshal.GetDelegateForFunctionPointer<GetInterfaceDelegate>(getInterfacePtr);
+                var getter = Marshal.GetDelegateForFunctionPointer<GetInterfaceDelegate>(funcPtr);
+                var texGuid = new Guid("6f15aaf2-d208-4e89-9ab4-489535d34f9c");
 
-                var textureGuid = new Guid("6f15aaf2-d208-4e89-9ab4-489535d34f9c"); // ID3D11Texture2D GUID
-                hr = getInterface(accessPtr, ref textureGuid, out IntPtr texturePtr);
-
+                hr = getter(accPtr, ref texGuid, out IntPtr texPtr);
                 if (hr != 0)
-                {
-                    throw new COMException($"GetInterface failed. HRESULT: 0x{hr:X8}", hr);
-                }
+                    throw new COMException($"GetInterface failed (0x{hr:X8})");
 
-                if (texturePtr == IntPtr.Zero)
-                {
-                    throw new Exception("GetInterface returned null pointer");
-                }
+                if (texPtr == IntPtr.Zero)
+                    throw new Exception("Texture pointer was null.");
 
-                return new Texture2D(texturePtr);
+                return new Texture2D(texPtr);
             }
             finally
             {
-                Marshal.Release(accessPtr);
+                Marshal.Release(accPtr);
             }
         }
 
