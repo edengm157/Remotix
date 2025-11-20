@@ -18,7 +18,7 @@
         </StackPanel>
 
         <Border Grid.Row="1" BorderBrush="Gray" BorderThickness="2" Margin="10">
-            <Image x:Name="CaptureImage" Stretch="Uniform"/>
+            <Image x:Name="PreviewImage" Stretch="Uniform"/>
         </Border>
     </Grid>
 </Window>

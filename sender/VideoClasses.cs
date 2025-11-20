@@ -13,35 +13,8 @@ using MapFlags = SharpDX.Direct3D11.MapFlags;
 using Device = SharpDX.Direct3D11.Device;
 using WinRT;
 
-
 namespace sender
 {
-    //internal class VideoEncoder
-    //{
-    //    private FrameCapturer cupturer;
-    //    private static Byte[] encodedFrame; // need to checl id this variable will be already with something in it or not while the complieration. if not add '?' after the []
-    //    private int bitrate;
-    //    private int framerate;
-    //    private string resolution;
-    //    private bool isInitialized;
-    //    // constructor
-    //    public VideoEncoder(FrameCapturer cupturer, int bitrate, int framerate, string resolution)
-    //    {
-    //        this.cupturer = cupturer;
-    //        this.bitrate = bitrate;
-    //        this.framerate = framerate;
-    //        this.resolution = resolution;
-    //        this.isInitialized = false;
-    //    }
-    //    public FrameCapturer Cupturer { get { return cupturer; } set { cupturer = value; } }             // getters and setters
-    //    public Byte[] EncodedFrame { get { return encodedFrame; } set { encodedFrame = value; } }       // getters and setters
-    //    public int Bitrate { get { return bitrate; } set { bitrate = value; } }                        // getters and setters 
-    //    public int Framerate { get { return framerate; } set { framerate = value; } }                 // getters and setters
-    //    public string Resolution { get { return resolution; } set { resolution = value; } }          // getters and setters
-    //    public bool UsInitialized { get { return isInitialized; } set { isInitialized = value; } }  // getters and setters
-
-    //    public override string ToString() { return "VideoEncoder: " + cupturer.ToString() + "\n" + bitrate + "kbps\n" + framerate + "fps\n" + resolution + "Initialized: " + isInitialized; } // toString method
-    //}
     internal class VideoEncoder : IDisposable
     {
         private H264Encoder _videoEnc;
@@ -53,6 +26,9 @@ namespace sender
 
         private long _totalBytes = 0;
         private int _sentFrames = 0;
+
+        // Event for preview updates - passes the raw frame data
+        public event Action<byte[], int, int> FrameDataReady;
 
         // Initialize encoder with width/height (moved verbatim from original InitializeEncoder)
         // dispatcher + statusCallback allow updating StatusText in MainWindow via callback
@@ -142,6 +118,9 @@ namespace sender
                         }
                     }
 
+                    // Raise event with frame data for preview
+                    FrameDataReady?.Invoke(_scratchFrame, d.Width, d.Height);
+
                     using (var rgb = new RgbImage(H264Sharp.ImageFormat.Bgra, d.Width, d.Height, _scratchFrame))
                     {
                         if (_videoEnc.Encode(rgb, out var outFrames))
@@ -197,42 +176,6 @@ namespace sender
         }
     }
 
-    //internal class FrameCapturer
-    //{
-    //    protected string sourceWindow;
-    //    protected Frame currentFrame;
-    //    // constructor
-    //    public FrameCapturer(Frame currentFrame, string sourceWindow)
-    //    {
-    //        this.currentFrame = currentFrame;
-    //        this.sourceWindow = sourceWindow;
-    //    }
-
-    //    public Frame CurrentFrame { get { return currentFrame; } set { currentFrame = value; } }                          // getters and setters
-    //    public string SourceWindow { get { return sourceWindow; } set { sourceWindow = value; } }                        // getters and setters
-
-    //    public override string ToString() { return "FrameCupturer: " + sourceWindow + " " + currentFrame.ToString(); } // toString method
-    //}
-
-    //internal class Frame
-    //{
-    //    protected int timestamp;
-    //    protected double width;
-    //    protected double height;
-    //    // constructor
-    //    public Frame(int timestamp, double width, double height)
-    //    {
-    //        this.timestamp = timestamp;
-    //        this.width = width;
-    //        this.height = height;
-    //    }
-
-    //    public int Timestamp { get { return timestamp; } set { timestamp = value; } }                        // getters and setters
-    //    public double Width { get { return width; } set { width = value; } }                                // getters and setters
-    //    public double Height { get { return height; } set { height = value; } }                            // getters and setters
-
-    //    public override string ToString() { return "Frame: " + timestamp + " " + width + "x" + height; } // toString method
-    //}
     internal class FrameCapturer : IDisposable
     {
         // Publicly accessible resources needed by the encoder
