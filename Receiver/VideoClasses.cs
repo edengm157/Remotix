@@ -1,39 +1,28 @@
-﻿//using SharpDX.Direct3D11;
-//using Windows.Graphics.DirectX.Direct3D11;
-//using Device = SharpDX.Direct3D11.Device;
-using H264Sharp;
+﻿using H264Sharp;
 using System;
-using System.Collections.Generic;
-using System.IO.Packaging;
-using System.Linq;
-using System.Runtime.InteropServices;
-using System.Text;
+using System.Threading;
 using System.Threading.Tasks;
 using System.Windows.Threading;
 using System.Net;
 using System.Net.Sockets;
 using System.Windows;
-using System.Windows.Media;
 using System.Windows.Media.Imaging;
 
 namespace Receiver
 {
     internal class VideoDecoder : IDisposable
     {
-        private H264Decoder _videoDecoder;     
+        private H264Decoder _videoDecoder;
         private int _receivedFrames = 0;
         private long _totalBytesReceived = 0;
 
-        // Event that fires when a frame is decoded and ready to display
-        public event Action<WriteableBitmap> FrameDecoded;
+        public event Action<BitmapSource> FrameDecoded;
 
-        // Initialize decoder
         public void InitializeDecoder(Dispatcher dispatcher = null, Action<string> statusCallback = null)
         {
             try
             {
                 _videoDecoder = new H264Decoder();
-
                 dispatcher?.Invoke(() =>
                 {
                     statusCallback?.Invoke("Decoder initialized and ready");
@@ -49,7 +38,6 @@ namespace Receiver
             }
         }
 
-        // DecodeAndDisplayFrame - receives encoded bytes and decodes them
         public void DecodeAndDisplayFrame(byte[] encodedData, Dispatcher dispatcher = null, Action<string> statusCallback = null)
         {
             if (_videoDecoder == null || encodedData == null || encodedData.Length == 0)
@@ -57,41 +45,52 @@ namespace Receiver
 
             try
             {
-                // Decode the H264 data
-                if (_videoDecoder.Decode(encodedData, encodedData.Length, out var decodedFrames))
+                RgbImage decodedImage = null;
+
+                // Decode the H264 bytes into an RgbImage
+                // Signature: Decode(byte[] encoded, int offset, int count, bool noDelay, out DecodingState state, ref RgbImage img)
+                if (_videoDecoder.Decode(encodedData, 0, encodedData.Length, noDelay: true, out DecodingState ds, ref decodedImage))
                 {
-                    if (frame != null)
+                    if (decodedImage != null)
                     {
-                        foreach (var frame in decodedFrames)
+                        _receivedFrames++;
+                        _totalBytesReceived += encodedData.Length;
+
+                        dispatcher?.Invoke(() =>
                         {
-                            _receivedFrames++;
-                            _totalBytesReceived += encodedData.Length;
-
-                            // Convert decoded frame to WriteableBitmap for display
-                            var bitmap = CreateBitmapFromFrame(frame);
-
-                            // Raise event with decoded bitmap
-                            dispatcher?.Invoke(() =>
+                            try
                             {
-                                FrameDecoded?.Invoke(bitmap);
+                                // Use H264Sharp's built-in ToBitmap() extension method
+                                // Then convert System.Drawing.Bitmap to WPF BitmapSource
+                                using (var bitmap = decodedImage.ToBitmap())
+                                {
+                                    var bitmapSource = System.Windows.Interop.Imaging.CreateBitmapSourceFromHBitmap(
+                                        bitmap.GetHbitmap(),
+                                        IntPtr.Zero,
+                                        Int32Rect.Empty,
+                                        BitmapSizeOptions.FromEmptyOptions());
 
+                                    // Freeze to make it cross-thread accessible
+                                    bitmapSource.Freeze();
+
+                                    FrameDecoded?.Invoke(bitmapSource);
+                                }
+
+                                // Update status every 15 frames
                                 if (_receivedFrames % 15 == 0)
                                 {
                                     statusCallback?.Invoke($"Decoded {_receivedFrames} frames | " +
-                                        $"{frame.Width}x{frame.Height} | " +
+                                        $"{decodedImage.Width}x{decodedImage.Height} | " +
                                         $"Received {_totalBytesReceived / 1024.0 / 1024.0:F2}MB");
                                 }
-                            });
-
-                            frame.Dispose();
-                        }
-                        }
+                            }
+                            catch (Exception convErr)
+                            {
+                                statusCallback?.Invoke($"Display error: {convErr.Message}");
+                            }
+                        });
+                    }
                 }
-                //if (_videoDecoder.Decode(encodedData, out var decodedFrames))
-                //{
-                    
-                    
-                //}
             }
             catch (Exception decErr)
             {
@@ -100,38 +99,6 @@ namespace Receiver
                     statusCallback?.Invoke($"Decoder error: {decErr.Message}");
                 });
             }
-        }
-
-        // Convert RgbImage to WriteableBitmap
-        private WriteableBitmap CreateBitmapFromFrame(RgbImage frame)
-        {
-            var bitmap = new WriteableBitmap(
-                frame.Width,
-                frame.Height,
-                96, 96,
-                PixelFormats.Bgra32,
-                null);
-
-            bitmap.Lock();
-            try
-            {
-                unsafe
-                {
-                    byte* dstPtr = (byte*)bitmap.BackBuffer;
-                    int stride = bitmap.BackBufferStride;
-
-                    // Copy frame data to bitmap
-                    Marshal.Copy(frame.ImageBytes, 0, (IntPtr)dstPtr, frame.ImageBytes.Length);
-                }
-
-                bitmap.AddDirtyRect(new Int32Rect(0, 0, frame.Width, frame.Height));
-            }
-            finally
-            {
-                bitmap.Unlock();
-            }
-
-            return bitmap;
         }
 
         public void DisposeDecoder()
@@ -148,7 +115,6 @@ namespace Receiver
 
     internal class FrameReceiver : IDisposable
     {
-        // Event raised when encoded data is received
         public event Action<byte[]> EncodedDataReceived;
 
         private UdpClient _udpClient;
@@ -164,11 +130,9 @@ namespace Receiver
 
         public FrameReceiver()
         {
-            // Default local port - should match sender's target port
             _localEndPoint = new IPEndPoint(IPAddress.Any, 12345);
         }
 
-        // Initialize UDP listener with optional custom port
         public void InitializeReceiver(int port = 12345, Dispatcher dispatcher = null, Action<string> statusCallback = null)
         {
             try
@@ -178,6 +142,7 @@ namespace Receiver
 
                 _localEndPoint = new IPEndPoint(IPAddress.Any, port);
                 _udpClient = new UdpClient(_localEndPoint);
+                _udpClient.Client.ReceiveBufferSize = 2 * 1024 * 1024; // 2MB buffer
 
                 dispatcher?.Invoke(() =>
                 {
@@ -194,7 +159,6 @@ namespace Receiver
             }
         }
 
-        // Start receiving frames
         public void StartReceiving()
         {
             if (_isReceiving || _udpClient == null)
@@ -202,7 +166,6 @@ namespace Receiver
 
             _isReceiving = true;
             _cancellationTokenSource = new CancellationTokenSource();
-
             _receiveTask = Task.Run(async () => await ReceiveLoop(_cancellationTokenSource.Token));
 
             _dispatcher?.Invoke(() =>
@@ -211,7 +174,6 @@ namespace Receiver
             });
         }
 
-        // Stop receiving frames
         public void StopReceiving()
         {
             if (!_isReceiving)
@@ -232,7 +194,6 @@ namespace Receiver
             });
         }
 
-        // Main receive loop
         private async Task ReceiveLoop(CancellationToken token)
         {
             while (_isReceiving && !token.IsCancellationRequested)
@@ -243,24 +204,16 @@ namespace Receiver
 
                     if (result.Buffer != null && result.Buffer.Length > 0)
                     {
-                        // Raise event with received encoded data
+                        // Pass H264 encoded bytes to decoder
                         EncodedDataReceived?.Invoke(result.Buffer);
                     }
                 }
-                catch (SocketException sockErr)
+                catch (SocketException) when (!_isReceiving)
                 {
-                    if (_isReceiving)
-                    {
-                        _dispatcher?.Invoke(() =>
-                        {
-                            _statusCallback?.Invoke($"Socket error: {sockErr.Message}");
-                        });
-                    }
                     break;
                 }
                 catch (ObjectDisposedException)
                 {
-                    // UDP client was disposed - exit gracefully
                     break;
                 }
                 catch (Exception recErr)
@@ -286,5 +239,4 @@ namespace Receiver
             DisposeReceiver();
         }
     }
-    
 }
