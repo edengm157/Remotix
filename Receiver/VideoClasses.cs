@@ -1,12 +1,14 @@
 ﻿using H264Sharp;
 using System;
-using System.Threading;
-using System.Threading.Tasks;
-using System.Windows.Threading;
 using System.Net;
 using System.Net.Sockets;
+using System.Runtime.InteropServices;
+using System.Threading;
+using System.Threading.Tasks;
 using System.Windows;
+using System.Windows.Media;
 using System.Windows.Media.Imaging;
+using System.Windows.Threading;
 
 namespace Receiver
 {
@@ -61,20 +63,10 @@ namespace Receiver
                             try
                             {
                                 // Use H264Sharp's built-in ToBitmap() extension method
-                                // Then convert System.Drawing.Bitmap to WPF BitmapSource
-                                using (var bitmap = decodedImage.ToBitmap())
-                                {
-                                    var bitmapSource = System.Windows.Interop.Imaging.CreateBitmapSourceFromHBitmap(
-                                        bitmap.GetHbitmap(),
-                                        IntPtr.Zero,
-                                        Int32Rect.Empty,
-                                        BitmapSizeOptions.FromEmptyOptions());
+                                // Then convert System.Drawing.Bitmap to WPF BitmapSource                               
+                                var bitmapSource = RgbImageToWriteableBitmap(decodedImage);
+                                FrameDecoded?.Invoke(bitmapSource);
 
-                                    // Freeze to make it cross-thread accessible
-                                    bitmapSource.Freeze();
-
-                                    FrameDecoded?.Invoke(bitmapSource);
-                                }
 
                                 // Update status every 15 frames
                                 if (_receivedFrames % 15 == 0)
@@ -110,6 +102,82 @@ namespace Receiver
         public void Dispose()
         {
             DisposeDecoder();
+        }
+
+        private WriteableBitmap RgbImageToWriteableBitmap(RgbImage img)
+        {
+            int width = img.Width;
+            int height = img.Height;
+            int strideSrc = img.Stride;
+
+            var wb = new WriteableBitmap(
+                width,
+                height,
+                96, 96,
+                PixelFormats.Bgr24,  // ✓ תיקון כאן
+                null);
+
+            wb.Lock();
+
+            int strideDst = wb.BackBufferStride;
+            int bytesPerRow = width * 3;
+
+            unsafe
+            {
+                byte* dst = (byte*)wb.BackBuffer;
+
+                if (img.IsManaged && img.ManagedBytes != null)
+                {
+                    fixed (byte* srcPtr = img.ManagedBytes)
+                    {
+                        byte* src = srcPtr + img.dataOffset;
+
+                        // אם ה-stride זהה, אפשר להעתיק הכל בבת אחת
+                        if (strideSrc == strideDst)
+                        {
+                            Buffer.MemoryCopy(src, dst, strideDst * height, strideDst * height);
+                        }
+                        else
+                        {
+                            // אחרת, שורה שורה
+                            for (int y = 0; y < height; y++)
+                            {
+                                Buffer.MemoryCopy(
+                                    src + y * strideSrc,
+                                    dst + y * strideDst,
+                                    strideDst,
+                                    bytesPerRow);
+                            }
+                        }
+                    }
+                }
+                else
+                {
+                    byte* src = (byte*)(img.NativeBytes + img.dataOffset);
+
+                    if (strideSrc == strideDst)
+                    {
+                        Buffer.MemoryCopy(src, dst, strideDst * height, strideDst * height);
+                    }
+                    else
+                    {
+                        for (int y = 0; y < height; y++)
+                        {
+                            Buffer.MemoryCopy(
+                                src + y * strideSrc,
+                                dst + y * strideDst,
+                                strideDst,
+                                bytesPerRow);
+                        }
+                    }
+                }
+            }
+
+            wb.AddDirtyRect(new Int32Rect(0, 0, width, height));
+            wb.Unlock();
+            wb.Freeze();
+
+            return wb;
         }
     }
 
