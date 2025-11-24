@@ -1,5 +1,7 @@
 ﻿using H264Sharp;
 using System;
+using System.Collections.Generic;
+using System.IO;
 using System.Net;
 using System.Net.Sockets;
 using System.Runtime.InteropServices;
@@ -9,7 +11,6 @@ using System.Windows;
 using System.Windows.Media;
 using System.Windows.Media.Imaging;
 using System.Windows.Threading;
-using System.Collections.Generic;
 
 namespace Receiver
 {
@@ -18,6 +19,8 @@ namespace Receiver
         private H264Decoder _videoDecoder;
         private int _receivedFrames = 0;
         private long _totalBytesReceived = 0;
+        private bool _hasReceivedSPS = false;
+        private int _failedDecodes = 0;
 
         public event Action<BitmapSource> FrameDecoded;
 
@@ -48,58 +51,89 @@ namespace Receiver
 
             try
             {
-                RgbImage decodedImage = null;
-
-                // Decode the H264 bytes into an RgbImage
-                bool decodeSuccess = _videoDecoder.Decode(encodedData, 0, encodedData.Length, noDelay: true, out DecodingState ds, ref decodedImage);
-
-                // DEBUG: Log decode attempt
-                if (_receivedFrames == 0)
+                // ✅ בדוק אם יש SPS/PPS בפריים הזה
+                if (!_hasReceivedSPS)
                 {
-                    dispatcher?.Invoke(() =>
+                    bool hasSPS = false;
+                    for (int i = 0; i < encodedData.Length - 4; i++)
                     {
-                        statusCallback?.Invoke($"First decode attempt: success={decodeSuccess}, state={ds}, image={decodedImage != null}");
-                    });
+                        if (encodedData[i] == 0x00 && encodedData[i + 1] == 0x00 &&
+                            encodedData[i + 2] == 0x00 && encodedData[i + 3] == 0x01)
+                        {
+                            int nalType = encodedData[i + 4] & 0x1F;
+                            if (nalType == 7) // SPS
+                            {
+                                hasSPS = true;
+                                _hasReceivedSPS = true;
+                                dispatcher?.Invoke(() =>
+                                {
+                                    statusCallback?.Invoke("✅ Received SPS/PPS - decoder ready!");
+                                });
+                                break;
+                            }
+                        }
+                    }
+
+                    if (!hasSPS)
+                    {
+                        _failedDecodes++;
+                        if (_failedDecodes % 30 == 0)
+                        {
+                            dispatcher?.Invoke(() =>
+                            {
+                                statusCallback?.Invoke($"⚠️ Waiting for keyframe (SPS/PPS)... failed {_failedDecodes} times");
+                            });
+                        }
+                        return; // לא ניתן לפענח בלי SPS/PPS
+                    }
                 }
 
-                if (decodeSuccess && decodedImage != null)
+                RgbImage decodedImage = null;
+
+                // נסה לפענח את הפריים
+                if (_videoDecoder.Decode(encodedData, 0, encodedData.Length, noDelay: true, out DecodingState ds, ref decodedImage))
                 {
-                    _receivedFrames++;
-                    _totalBytesReceived += encodedData.Length;
-
-                    dispatcher?.Invoke(() =>
+                    if (decodedImage != null)
                     {
-                        try
-                        {
-                            var bitmapSource = RgbImageToWriteableBitmap(decodedImage);
-                            FrameDecoded?.Invoke(bitmapSource);
+                        _receivedFrames++;
+                        _totalBytesReceived += encodedData.Length;
+                        _failedDecodes = 0; // איפוס ספירת כשלונות
 
-                            // Update status every 15 frames
-                            if (_receivedFrames % 15 == 0)
-                            {
-                                statusCallback?.Invoke($"Decoded {_receivedFrames} frames | " +
-                                    $"{decodedImage.Width}x{decodedImage.Height} | " +
-                                    $"Received {_totalBytesReceived / 1024.0 / 1024.0:F2}MB");
-                            }
-                            else if (_receivedFrames == 1)
-                            {
-                                statusCallback?.Invoke($"First frame decoded! {decodedImage.Width}x{decodedImage.Height}");
-                            }
-                        }
-                        catch (Exception convErr)
+                        dispatcher?.Invoke(() =>
                         {
-                            statusCallback?.Invoke($"Display error: {convErr.Message}");
-                        }
-                    });
+                            try
+                            {
+                                var bitmapSource = RgbImageToWriteableBitmap(decodedImage);
+                                FrameDecoded?.Invoke(bitmapSource);
+
+                                // עדכן סטטוס כל 15 פריימים
+                                if (_receivedFrames % 15 == 0)
+                                {
+                                    statusCallback?.Invoke($"Decoded {_receivedFrames} frames | " +
+                                        $"{decodedImage.Width}x{decodedImage.Height} | " +
+                                        $"Received {_totalBytesReceived / 1024.0 / 1024.0:F2}MB");
+                                }
+                                else if (_receivedFrames == 1)
+                                {
+                                    statusCallback?.Invoke($"First frame decoded! {decodedImage.Width}x{decodedImage.Height}");
+                                }
+                            }
+                            catch (Exception convErr)
+                            {
+                                statusCallback?.Invoke($"Display error: {convErr.Message}");
+                            }
+                        });
+                    }
                 }
                 else
                 {
-                    // DEBUG: Log why decode failed
-                    if (_receivedFrames < 5)
+                    _failedDecodes++;
+                    // לוג רק את הכשלונות הראשונים
+                    if (_failedDecodes <= 5)
                     {
                         dispatcher?.Invoke(() =>
                         {
-                            statusCallback?.Invoke($"Decode failed: success={decodeSuccess}, state={ds}, hasImage={decodedImage != null}, dataSize={encodedData.Length}");
+                            statusCallback?.Invoke($"Decode failed: state={ds}, hasImage={decodedImage != null}, dataSize={encodedData.Length}");
                         });
                     }
                 }
@@ -212,16 +246,25 @@ namespace Receiver
         private Dispatcher _dispatcher;
         private Action<string> _statusCallback;
 
-        // --- NEW: chunking constants and buffer
-        private const int HEADER_SIZE = 5;
-        private List<byte> _frameBuffer = new List<byte>();
-        private int _chunksReceived = 0;
+        // ✅ שינוי: שימוש ב-List<byte[]> במקום List<byte> - יעיל יותר
+        private List<byte[]> _frameChunks = new List<byte[]>();
+        private int _receivedChunks = 0;
+        private int _totalFrames = 0;
+
+        // קובץ לוג
+        private readonly string _logPath = "receiver_log.txt";
 
         public bool IsReceiving => _isReceiving;
 
         public FrameReceiver()
         {
             _localEndPoint = new IPEndPoint(IPAddress.Any, 12345);
+
+            // נקה קובץ לוג קודם
+            if (File.Exists(_logPath))
+            {
+                File.Delete(_logPath);
+            }
         }
 
         public void InitializeReceiver(int port = 12345, Dispatcher dispatcher = null, Action<string> statusCallback = null)
@@ -231,7 +274,7 @@ namespace Receiver
                 _dispatcher = dispatcher;
                 _statusCallback = statusCallback;
 
-                // CRITICAL FIX: Close existing UDP client if it exists
+                // ✅ תיקון: אם יש כבר UDP client, סגור אותו קודם
                 if (_udpClient != null)
                 {
                     try
@@ -246,12 +289,12 @@ namespace Receiver
                 _localEndPoint = new IPEndPoint(IPAddress.Any, port);
                 _udpClient = new UdpClient();
 
-                // Allow reuse of the address/port - this prevents "address already in use" errors
+                // אפשר שימוש חוזר בפורט
                 _udpClient.Client.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
                 _udpClient.Client.Bind(_localEndPoint);
 
-                // Increase buffer size to reduce packet loss
-                _udpClient.Client.ReceiveBufferSize = 2 * 1024 * 1024; // 2MB buffer
+                // הגדל את ה-buffer כדי למנוע אובדן חבילות
+                _udpClient.Client.ReceiveBufferSize = 2 * 1024 * 1024; // 2MB
 
                 dispatcher?.Invoke(() =>
                 {
@@ -270,8 +313,14 @@ namespace Receiver
 
         public void StartReceiving()
         {
-            if (_isReceiving || _udpClient == null)
+            if (_isReceiving)
                 return;
+
+            // ✅ תיקון: אתחל מחדש אם אין UDP client
+            if (_udpClient == null)
+            {
+                InitializeReceiver(12345, _dispatcher, _statusCallback);
+            }
 
             _isReceiving = true;
             _cancellationTokenSource = new CancellationTokenSource();
@@ -290,22 +339,31 @@ namespace Receiver
 
             _isReceiving = false;
 
-            // Cancel the receive task
+            // בטל את ה-task
             _cancellationTokenSource?.Cancel();
 
-            // CRITICAL FIX: Close the UDP client to unblock ReceiveAsync
+            // ✅ תיקון: סגור את ה-UDP client כדי לשחרר את ה-ReceiveAsync
+            if (_udpClient != null)
+            {
+                try
+                {
+                    _udpClient.Close();
+                    _udpClient.Dispose();
+                }
+                catch { }
+                _udpClient = null;
+            }
+
+            // המתן ל-task להסתיים
             try
             {
-                _udpClient?.Close();
+                _receiveTask?.Wait(1000);
             }
             catch { }
 
-            // Wait for the task to complete
-            try
-            {
-                _receiveTask?.Wait(2000);
-            }
-            catch { }
+            // נקה את החלקים שנאספו
+            _frameChunks.Clear();
+            _receivedChunks = 0;
 
             _dispatcher?.Invoke(() =>
             {
@@ -315,6 +373,8 @@ namespace Receiver
 
         private async Task ReceiveLoop(CancellationToken token)
         {
+            LogToFile("🚀 ReceiveLoop STARTED - waiting for packets...");
+
             int packetsReceived = 0;
 
             while (_isReceiving && !token.IsCancellationRequested)
@@ -324,103 +384,128 @@ namespace Receiver
                     var result = await _udpClient.ReceiveAsync();
                     packetsReceived++;
 
+                    if (packetsReceived == 1)
+                    {
+                        LogToFile($"📦 First packet received! Size: {result.Buffer?.Length ?? 0} bytes from {result.RemoteEndPoint}");
+
+                        _dispatcher?.Invoke(() =>
+                        {
+                            _statusCallback?.Invoke($"First packet received from {result.RemoteEndPoint}!");
+                        });
+                    }
+
                     if (result.Buffer != null && result.Buffer.Length > 0)
                     {
-                        // Log first packet for debugging
-                        if (packetsReceived == 1)
-                        {
-                            _dispatcher?.Invoke(() =>
-                            {
-                                _statusCallback?.Invoke($"First packet received! Size: {result.Buffer.Length} bytes from {result.RemoteEndPoint}");
-                            });
-                        }
-
-                        // Process packet and check if frame is complete
-                        byte[] completeFrame = ProcessPacket(result.Buffer);
-
-                        if (completeFrame != null)
-                        {
-                            // Frame is complete, pass to decoder
-                            EncodedDataReceived?.Invoke(completeFrame);
-                        }
+                        ParseIncomingPacket(result.Buffer);
                     }
                 }
                 catch (SocketException) when (!_isReceiving)
                 {
-                    break; // Expected when stopping
+                    LogToFile("❌ SocketException - stopping (expected)");
+                    break; // צפוי כאשר עוצרים
                 }
                 catch (ObjectDisposedException)
                 {
-                    break; // Expected when stopping
+                    LogToFile("❌ ObjectDisposedException - stopping (expected)");
+                    break; // צפוי כאשר עוצרים
                 }
                 catch (Exception recErr)
                 {
+                    LogToFile($"❌ Receive error: {recErr.Message}");
                     _dispatcher?.Invoke(() =>
                     {
                         _statusCallback?.Invoke($"Receive error: {recErr.Message}");
                     });
                 }
             }
+
+            LogToFile("🛑 ReceiveLoop ENDED");
         }
 
-        private byte[] ProcessPacket(byte[] packet)
+        private void ParseIncomingPacket(byte[] packet)
         {
-            if (packet == null || packet.Length < HEADER_SIZE)
-                return null;
+            if (packet.Length < 5)
+            {
+                LogToFile($"❌ Packet too small: {packet.Length} bytes");
+                return;
+            }
 
-            // Parse header
+            // קרא את הכותרת: [payloadSize(4)][isLastChunk(1)][payload...]
             int payloadSize = BitConverter.ToInt32(packet, 0);
             bool isLastChunk = packet[4] == 1;
 
-            // Validate payload size
-            if (payloadSize < 0 || payloadSize > packet.Length - HEADER_SIZE)
+            // וודא שהחבילה תקינה
+            if (payloadSize < 0 || packet.Length < 5 + payloadSize)
             {
-                ResetBuffer();
-                return null;
+                LogToFile($"❌ Corrupted packet: payloadSize={payloadSize}, packetLength={packet.Length}");
+                _frameChunks.Clear();
+                _receivedChunks = 0;
+                return;
             }
 
-            // Extract payload
+            // חלץ את ה-payload
             byte[] payload = new byte[payloadSize];
-            Buffer.BlockCopy(packet, HEADER_SIZE, payload, 0, payloadSize);
+            Buffer.BlockCopy(packet, 5, payload, 0, payloadSize);
 
-            // Add to buffer
-            _frameBuffer.AddRange(payload);
-            _chunksReceived++;
+            _frameChunks.Add(payload);
+            _receivedChunks++;
 
-            // If this is the last chunk, return the complete frame
-            if (isLastChunk)
+            LogToFile($"✅ Chunk {_receivedChunks}: {payloadSize} bytes, isLast={isLastChunk}");
+
+            if (!isLastChunk)
             {
-                byte[] completeFrame = _frameBuffer.ToArray();
-                int totalChunks = _chunksReceived;
-
-                // Reset for next frame
-                ResetBuffer();
-
-                return completeFrame;
+                // עדיין צריך להמתין לחלקים נוספים
+                return;
             }
 
-            // Frame not yet complete
-            return null;
+            // ✅ זה החלק האחרון - בנה את הפריים המלא
+            int totalSize = 0;
+            foreach (var chunk in _frameChunks)
+                totalSize += chunk.Length;
+
+            byte[] fullFrame = new byte[totalSize];
+            int offset = 0;
+
+            foreach (var chunk in _frameChunks)
+            {
+                Buffer.BlockCopy(chunk, 0, fullFrame, offset, chunk.Length);
+                offset += chunk.Length;
+            }
+
+            _totalFrames++;
+            LogToFile($"🎬 FULL FRAME #{_totalFrames}: {_receivedChunks} chunks, {totalSize} bytes total");
+
+            // לוג את ה-100 בתים הראשונים לבדיקה
+            if (_totalFrames <= 2)
+            {
+                LogToFile($"Frame data (first 100 bytes): {BitConverter.ToString(fullFrame, 0, Math.Min(100, fullFrame.Length))}");
+            }
+
+            LogToFile("─────────────────────────────────────────");
+
+            // נקה את רשימת החלקים לפריים הבא
+            _frameChunks.Clear();
+            _receivedChunks = 0;
+
+            // שלח את הפריים המלא לדקודר
+            EncodedDataReceived?.Invoke(fullFrame);
         }
 
-        private void ResetBuffer()
+        private void LogToFile(string message)
         {
-            _frameBuffer.Clear();
-            _chunksReceived = 0;
+            try
+            {
+                File.AppendAllText(_logPath, $"[{DateTime.Now:HH:mm:ss.fff}] {message}\n");
+            }
+            catch
+            {
+                // התעלם משגיאות בכתיבת לוג
+            }
         }
 
         public void DisposeReceiver()
         {
             StopReceiving();
-
-            try
-            {
-                _udpClient?.Close();
-                _udpClient?.Dispose();
-            }
-            catch { }
-
-            _udpClient = null;
             _cancellationTokenSource?.Dispose();
         }
 

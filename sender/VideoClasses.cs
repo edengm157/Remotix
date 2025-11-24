@@ -22,25 +22,35 @@ namespace sender
     {
         private H264Encoder _videoEnc;
         private byte[] _scratchFrame;
-        private List<byte[]> _nalCache = new List<byte[]>(); // Cache for SPS/PPS
+        private List<byte[]> _nalCache = new List<byte[]>();
 
         private long _totalBytes = 0;
         private int _sentFrames = 0;
 
-        // --- NEW: log path
         private readonly string _logPath = "h264_sent.log";
 
-        // --- NEW: chunking constants
         private const int MAX_PACKET_SIZE = 1400;
         private const int HEADER_SIZE = 5;
         private const int MAX_PAYLOAD_SIZE = MAX_PACKET_SIZE - HEADER_SIZE;
 
         public event Action<byte[], int, int> FrameDataReady;
 
+        public VideoEncoder()
+        {
+            // נקה לוג ישן
+            if (File.Exists(_logPath))
+            {
+                File.Delete(_logPath);
+            }
+            WriteLog("🚀 VideoEncoder initialized - log started");
+        }
+
         public void InitializeEncoder(int w, int h, Dispatcher dispatcher = null, Action<string> statusCallback = null)
         {
             try
             {
+                WriteLog($"⚙️ Initializing encoder: {w}x{h}");
+
                 _videoEnc = new H264Encoder();
 
                 var encParams = _videoEnc.GetDefaultParameters();
@@ -71,6 +81,8 @@ namespace sender
                 int rawSize = w * h * 4;
                 _scratchFrame = new byte[rawSize];
 
+                WriteLog($"✅ Encoder ready: {w}x{h}@15fps");
+
                 dispatcher?.Invoke(() =>
                 {
                     statusCallback?.Invoke($"Encoder ready {w}x{h}@15fps");
@@ -78,6 +90,7 @@ namespace sender
             }
             catch (Exception initErr)
             {
+                WriteLog($"❌ Encoder init error: {initErr.Message}");
                 throw;
             }
         }
@@ -125,30 +138,31 @@ namespace sender
 
                             if (encodedBytes != null && encodedBytes.Length > 0)
                             {
-                                // Parse NAL units to extract SPS/PPS on first frame
+                                // חלץ SPS/PPS בפעם הראשונה
                                 if (_sentFrames == 0)
                                 {
                                     ExtractSPSPPS(encodedBytes);
                                 }
 
-                                // Prepend SPS/PPS to every keyframe (larger frames)
+                                // הוסף SPS/PPS לפריים הראשון וכל 30 פריימים (keyframes)
                                 byte[] dataToSend = encodedBytes;
-                                if (_nalCache.Count > 0 && (encodedBytes.Length > 10000 || _sentFrames == 0))
+                                if (_nalCache.Count > 0 && (_sentFrames % 30 == 0 || _sentFrames == 0))
                                 {
                                     using (var ms = new MemoryStream())
                                     {
-                                        // Write cached SPS/PPS
+                                        // כתוב SPS/PPS קודם
                                         foreach (var nal in _nalCache)
                                         {
                                             ms.Write(nal, 0, nal.Length);
                                         }
-                                        // Write frame data
+                                        // כתוב את הפריים
                                         ms.Write(encodedBytes, 0, encodedBytes.Length);
                                         dataToSend = ms.ToArray();
                                     }
 
                                     if (_sentFrames == 0)
                                     {
+                                        WriteLog($"🎬 First frame with SPS/PPS headers: {dataToSend.Length} bytes");
                                         dispatcher?.Invoke(() =>
                                         {
                                             statusCallback?.Invoke($"First frame with headers: {dataToSend.Length} bytes");
@@ -156,9 +170,8 @@ namespace sender
                                     }
                                 }
 
-                                // --- SEND UDP IN CHUNKS + LOG ---
+                                // שלח בחלקים + לוג
                                 SendFrameInChunks(dataToSend, udpClient, remoteTarget);
-                                WriteLog(dataToSend);
 
                                 _sentFrames++;
                                 _totalBytes += dataToSend.Length;
@@ -181,6 +194,7 @@ namespace sender
             }
             catch (Exception encErr)
             {
+                WriteLog($"❌ Encode error: {encErr.Message}");
                 dispatcher?.Invoke(() =>
                 {
                     statusCallback?.Invoke($"Encoder issue: {encErr.Message}");
@@ -191,9 +205,14 @@ namespace sender
         private void SendFrameInChunks(byte[] frameData, UdpClient udpClient, IPEndPoint remoteTarget)
         {
             if (frameData == null || frameData.Length == 0)
+            {
+                WriteLog("❌ SendFrameInChunks: frameData is null or empty!");
                 return;
+            }
 
             int totalChunks = (int)Math.Ceiling((double)frameData.Length / MAX_PAYLOAD_SIZE);
+
+            WriteLog($"📤 Frame #{_sentFrames + 1}: {frameData.Length} bytes → {totalChunks} chunks to {remoteTarget}");
 
             for (int chunkIndex = 0; chunkIndex < totalChunks; chunkIndex++)
             {
@@ -201,26 +220,32 @@ namespace sender
                 int payloadSize = Math.Min(MAX_PAYLOAD_SIZE, frameData.Length - offset);
                 bool isLastChunk = (chunkIndex == totalChunks - 1);
 
-                // Create packet: [payloadSize(4)][isLastChunk(1)][payload]
+                // צור חבילה: [payloadSize(4)][isLastChunk(1)][payload]
                 byte[] packet = new byte[HEADER_SIZE + payloadSize];
 
-                // Write header
                 BitConverter.GetBytes(payloadSize).CopyTo(packet, 0);
                 packet[4] = (byte)(isLastChunk ? 1 : 0);
 
-                // Write payload
                 System.Buffer.BlockCopy(frameData, offset, packet, HEADER_SIZE, payloadSize);
 
-                // Send packet
                 try
                 {
-                    udpClient.Send(packet, packet.Length, remoteTarget);
+                    int bytesSent = udpClient.Send(packet, packet.Length, remoteTarget);
+
+                    // לוג רק לחלק הראשון והאחרון
+                    if (chunkIndex == 0 || chunkIndex == totalChunks - 1)
+                    {
+                        WriteLog($"  ✅ Chunk {chunkIndex + 1}/{totalChunks}: sent {bytesSent} bytes (payload: {payloadSize}, isLast: {isLastChunk})");
+                    }
                 }
                 catch (Exception ex)
                 {
-                    // Ignore send errors
+                    WriteLog($"  ❌ FAILED chunk {chunkIndex + 1}: {ex.Message}");
                 }
             }
+
+            WriteLog($"✅ Frame #{_sentFrames + 1} sent: {totalChunks} chunks");
+            WriteLog("─────────────────────────────────────────");
         }
 
         private void ExtractSPSPPS(byte[] data)
@@ -231,7 +256,7 @@ namespace sender
                 {
                     int nalType = data[i + 4] & 0x1F;
 
-                    if (nalType == 7 || nalType == 8)
+                    if (nalType == 7 || nalType == 8) // SPS או PPS
                     {
                         int nalEnd = i + 4;
                         for (int j = i + 4; j < data.Length - 3; j++)
@@ -247,31 +272,28 @@ namespace sender
                         byte[] nal = new byte[nalEnd - i];
                         System.Buffer.BlockCopy(data, i, nal, 0, nal.Length);
                         _nalCache.Add(nal);
+
+                        WriteLog($"📋 Extracted NAL type {nalType} ({(nalType == 7 ? "SPS" : "PPS")}): {nal.Length} bytes");
                     }
                 }
             }
         }
 
-        // --- NEW: log helper ---
-        private void WriteLog(byte[] data)
+        private void WriteLog(string message)
         {
             try
             {
-                using var fs = new FileStream(_logPath, FileMode.Append, FileAccess.Write);
-                using var sw = new StreamWriter(fs);
-
-                sw.WriteLine($"==== Packet #{_sentFrames} | {data.Length} bytes ====");
-                sw.WriteLine(BitConverter.ToString(data).Replace("-", " "));
-                sw.WriteLine();
+                File.AppendAllText(_logPath, $"[{DateTime.Now:HH:mm:ss.fff}] {message}\n");
             }
             catch
             {
-                // ignore logging errors
+                // התעלם משגיאות בכתיבת לוג
             }
         }
 
         public void DisposeEncoder()
         {
+            WriteLog("🛑 Encoder disposed");
             _videoEnc?.Dispose();
             _videoEnc = null;
         }
@@ -384,6 +406,7 @@ namespace sender
             }
             catch (Exception frameErr)
             {
+                // התעלם משגיאות בלכידת פריימים
             }
         }
 
