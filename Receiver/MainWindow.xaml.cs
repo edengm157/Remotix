@@ -18,17 +18,15 @@ namespace Receiver
             Closed += MainWindow_Closed;
         }
 
-        private void PortTextBox_TextChanged(object sender, System.Windows.Controls.TextChangedEventArgs e)
-        {
-            // Optional: validate port input
-        }
-
         private void StartButton_Click(object sender, RoutedEventArgs e)
         {
             try
             {
-                // Initialize receiver on port 12345 (matching sender)
-                _frameReceiver.InitializeReceiver(12345, Dispatcher, UpdateStatus);
+                // Use default port 12345 (matching sender)
+                int port = 12345;
+
+                // Initialize receiver on specified port
+                _frameReceiver.InitializeReceiver(port, Dispatcher, UpdateStatus);
 
                 // Initialize decoder
                 _videoDecoder.InitializeDecoder(Dispatcher, UpdateStatus);
@@ -39,11 +37,11 @@ namespace Receiver
                     _videoDecoder.DecodeAndDisplayFrame(encodedData, Dispatcher, UpdateStatus);
                 };
 
-                _videoDecoder.FrameDecoded += (bitmap) =>
+                _videoDecoder.FrameDecoded += (bitmapSource) =>
                 {
                     Dispatcher.Invoke(() =>
                     {
-                        DisplayImage.Source = bitmap;
+                        DisplayImage.Source = bitmapSource;
                     });
                 };
 
@@ -53,7 +51,7 @@ namespace Receiver
                 // Update UI
                 StartButton.IsEnabled = false;
                 StopButton.IsEnabled = true;
-                StatusText.Text = "Waiting for frames...";
+                StatusText.Text = $"Listening on port {port}... Make sure sender is sending to localhost:{port}";
             }
             catch (Exception ex)
             {
