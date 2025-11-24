@@ -1,4 +1,7 @@
-﻿using System.Runtime.InteropServices;
+﻿using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Runtime.InteropServices;
 using System.Windows.Threading;
 using SharpDX.Direct3D11;
 using H264Sharp;
@@ -19,19 +22,21 @@ namespace sender
     {
         private H264Encoder _videoEnc;
         private byte[] _scratchFrame;
-
-        private bool _isRecording = false;
-        private TimeSpan _frameTimeStamp = TimeSpan.Zero;
-        private TimeSpan _frameInterval = TimeSpan.FromSeconds(1.0 / 15.0);
+        private List<byte[]> _nalCache = new List<byte[]>(); // Cache for SPS/PPS
 
         private long _totalBytes = 0;
         private int _sentFrames = 0;
 
-        // Event for preview updates - passes the raw frame data
+        // --- NEW: log path
+        private readonly string _logPath = "h264_sent.log";
+
+        // --- NEW: chunking constants
+        private const int MAX_PACKET_SIZE = 1400;
+        private const int HEADER_SIZE = 5;
+        private const int MAX_PAYLOAD_SIZE = MAX_PACKET_SIZE - HEADER_SIZE;
+
         public event Action<byte[], int, int> FrameDataReady;
 
-        // Initialize encoder with width/height (moved verbatim from original InitializeEncoder)
-        // dispatcher + statusCallback allow updating StatusText in MainWindow via callback
         public void InitializeEncoder(int w, int h, Dispatcher dispatcher = null, Action<string> statusCallback = null)
         {
             try
@@ -59,7 +64,7 @@ namespace sender
                 encParams.sSpatialLayers[0].iSpatialBitrate = 5000000;
 
                 encParams.bEnableFrameSkip = false;
-                encParams.uiIntraPeriod = 90;
+                encParams.uiIntraPeriod = 30; // Keyframe every 2 seconds
 
                 _videoEnc.Initialize(encParams);
 
@@ -73,18 +78,10 @@ namespace sender
             }
             catch (Exception initErr)
             {
-                // keep behavior similar to original
                 throw;
             }
         }
 
-        // EncodeAndSendFrame method takes the SharpDX Texture2D (copied logic from original)
-        // Parameters:
-        // - tex: the SharpDX texture to encode
-        // - desc: texture description (width/height etc)
-        // - mainD3D: device used for CopyResource / MapSubresource
-        // - udpClient, remoteTarget: for send
-        // - dispatcher, statusCallback: to update UI
         public void EncodeAndSendFrame(Texture2D tex, SharpDX.Direct3D11.Texture2DDescription desc, Device mainD3D, UdpClient udpClient, IPEndPoint remoteTarget, Dispatcher dispatcher = null, Action<string> statusCallback = null)
         {
             if (_videoEnc == null) return;
@@ -118,7 +115,6 @@ namespace sender
                         }
                     }
 
-                    // Raise event with frame data for preview
                     FrameDataReady?.Invoke(_scratchFrame, d.Width, d.Height);
 
                     using (var rgb = new RgbImage(H264Sharp.ImageFormat.Bgra, d.Width, d.Height, _scratchFrame))
@@ -129,26 +125,54 @@ namespace sender
 
                             if (encodedBytes != null && encodedBytes.Length > 0)
                             {
-                                // UDP send
-                                _ = udpClient.SendAsync(encodedBytes, encodedBytes.Length, remoteTarget);
+                                // Parse NAL units to extract SPS/PPS on first frame
+                                if (_sentFrames == 0)
+                                {
+                                    ExtractSPSPPS(encodedBytes);
+                                }
+
+                                // Prepend SPS/PPS to every keyframe (larger frames)
+                                byte[] dataToSend = encodedBytes;
+                                if (_nalCache.Count > 0 && (encodedBytes.Length > 10000 || _sentFrames == 0))
+                                {
+                                    using (var ms = new MemoryStream())
+                                    {
+                                        // Write cached SPS/PPS
+                                        foreach (var nal in _nalCache)
+                                        {
+                                            ms.Write(nal, 0, nal.Length);
+                                        }
+                                        // Write frame data
+                                        ms.Write(encodedBytes, 0, encodedBytes.Length);
+                                        dataToSend = ms.ToArray();
+                                    }
+
+                                    if (_sentFrames == 0)
+                                    {
+                                        dispatcher?.Invoke(() =>
+                                        {
+                                            statusCallback?.Invoke($"First frame with headers: {dataToSend.Length} bytes");
+                                        });
+                                    }
+                                }
+
+                                // --- SEND UDP IN CHUNKS + LOG ---
+                                SendFrameInChunks(dataToSend, udpClient, remoteTarget);
+                                WriteLog(dataToSend);
 
                                 _sentFrames++;
-                                _totalBytes += encodedBytes.Length;
+                                _totalBytes += dataToSend.Length;
 
-                                double comp = (encodedBytes.Length * 100.0) / (d.Width * d.Height * 4);
-
-                                if (_sentFrames % 15 == 0)
+                                if (_sentFrames % 15 == 0 || _sentFrames <= 3)
                                 {
                                     dispatcher?.Invoke(() =>
                                     {
-                                        statusCallback?.Invoke($"Frame {_sentFrames} | {d.Width}x{d.Height} | {encodedBytes.Length / 1024.0:F1}KB | Total {_totalBytes / 1024.0 / 1024.0:F2}MB | Comp {comp:F1}%");
+                                        statusCallback?.Invoke($"Frame #{_sentFrames} | {dataToSend.Length} bytes | Total {_totalBytes / 1024.0 / 1024.0:F2}MB");
                                     });
                                 }
                             }
                         }
                     }
-
-                    _frameTimeStamp += _frameInterval;
                 }
                 finally
                 {
@@ -161,6 +185,88 @@ namespace sender
                 {
                     statusCallback?.Invoke($"Encoder issue: {encErr.Message}");
                 });
+            }
+        }
+
+        private void SendFrameInChunks(byte[] frameData, UdpClient udpClient, IPEndPoint remoteTarget)
+        {
+            if (frameData == null || frameData.Length == 0)
+                return;
+
+            int totalChunks = (int)Math.Ceiling((double)frameData.Length / MAX_PAYLOAD_SIZE);
+
+            for (int chunkIndex = 0; chunkIndex < totalChunks; chunkIndex++)
+            {
+                int offset = chunkIndex * MAX_PAYLOAD_SIZE;
+                int payloadSize = Math.Min(MAX_PAYLOAD_SIZE, frameData.Length - offset);
+                bool isLastChunk = (chunkIndex == totalChunks - 1);
+
+                // Create packet: [payloadSize(4)][isLastChunk(1)][payload]
+                byte[] packet = new byte[HEADER_SIZE + payloadSize];
+
+                // Write header
+                BitConverter.GetBytes(payloadSize).CopyTo(packet, 0);
+                packet[4] = (byte)(isLastChunk ? 1 : 0);
+
+                // Write payload
+                System.Buffer.BlockCopy(frameData, offset, packet, HEADER_SIZE, payloadSize);
+
+                // Send packet
+                try
+                {
+                    udpClient.Send(packet, packet.Length, remoteTarget);
+                }
+                catch (Exception ex)
+                {
+                    // Ignore send errors
+                }
+            }
+        }
+
+        private void ExtractSPSPPS(byte[] data)
+        {
+            for (int i = 0; i < data.Length - 4; i++)
+            {
+                if (data[i] == 0x00 && data[i + 1] == 0x00 && data[i + 2] == 0x00 && data[i + 3] == 0x01)
+                {
+                    int nalType = data[i + 4] & 0x1F;
+
+                    if (nalType == 7 || nalType == 8)
+                    {
+                        int nalEnd = i + 4;
+                        for (int j = i + 4; j < data.Length - 3; j++)
+                        {
+                            if (data[j] == 0x00 && data[j + 1] == 0x00 && data[j + 2] == 0x00 && data[j + 3] == 0x01)
+                            {
+                                nalEnd = j;
+                                break;
+                            }
+                        }
+                        if (nalEnd == i + 4) nalEnd = data.Length;
+
+                        byte[] nal = new byte[nalEnd - i];
+                        System.Buffer.BlockCopy(data, i, nal, 0, nal.Length);
+                        _nalCache.Add(nal);
+                    }
+                }
+            }
+        }
+
+        // --- NEW: log helper ---
+        private void WriteLog(byte[] data)
+        {
+            try
+            {
+                using var fs = new FileStream(_logPath, FileMode.Append, FileAccess.Write);
+                using var sw = new StreamWriter(fs);
+
+                sw.WriteLine($"==== Packet #{_sentFrames} | {data.Length} bytes ====");
+                sw.WriteLine(BitConverter.ToString(data).Replace("-", " "));
+                sw.WriteLine();
+            }
+            catch
+            {
+                // ignore logging errors
             }
         }
 
@@ -178,14 +284,11 @@ namespace sender
 
     internal class FrameCapturer : IDisposable
     {
-        // Publicly accessible resources needed by the encoder
         public Device MainDevice => _mainD3D;
         public UdpClient UdpClient => _udpClient;
         public IPEndPoint RemoteTarget => _remoteTarget;
         public SizeInt32? LastSize => _lastSize;
 
-        // Event raised when a new SharpDX Texture2D is ready for encoding.
-        // The handler receives the texture and its Description
         public event Action<Texture2D, SharpDX.Direct3D11.Texture2DDescription> FrameReady;
 
         private GraphicsCaptureItem _captureItem;
@@ -201,21 +304,16 @@ namespace sender
 
         public FrameCapturer()
         {
-            // Defaults — match original intent
             _udpClient = new UdpClient();
             _remoteTarget = new IPEndPoint(IPAddress.Loopback, 12345);
         }
 
         public void InitD3D()
         {
-            // Copied InitD3D body from original MainWindow.InitD3D
             _mainD3D = new Device(SharpDX.Direct3D.DriverType.Hardware, DeviceCreationFlags.BgraSupport);
             _winRTDevice = Direct3D11Helper.CreateDevice(_mainD3D);
-            // UDP already created in ctor
         }
 
-        // StartCaptureAsync encapsulates the original StartButton_Click pick-and-start flow.
-        // We need the Window instance only to get the HWND for the picker initialization.
         public async System.Threading.Tasks.Task StartCaptureAsync(Window win)
         {
             var picker = new GraphicsCapturePicker();
@@ -223,17 +321,14 @@ namespace sender
 
             WinRT.Interop.InitializeWithWindow.Initialize(picker, hwnd);
 
-            // Let user pick window/monitor
             _captureItem = await picker.PickSingleItemAsync();
             if (_captureItem == null)
             {
-                // Caller will handle UI message; just return
                 return;
             }
 
             _lastSize = _captureItem.Size;
 
-            // Create frame pool
             _framePool =
                 Direct3D11CaptureFramePool.CreateFreeThreaded(
                     _winRTDevice,
@@ -252,7 +347,6 @@ namespace sender
 
         public void StopCapture()
         {
-            // Equivalent to original StopCapture but only disposes the capture objects
             _session?.Dispose();
             _session = null;
 
@@ -286,17 +380,13 @@ namespace sender
 
                 using var texture = Direct3D11Helper.CreateSharpDXTexture2D(frame.Surface);
 
-                // Raise event to hand the texture to the encoder
                 FrameReady?.Invoke(texture, texture.Description);
             }
             catch (Exception frameErr)
             {
-                // Minimal internal handling; UI will be notified by the caller if needed
-                // (In original code, StatusText updated via Dispatcher; here we don't have UI reference)
             }
         }
 
-        // Dispose helpers
         public void DisposeAll()
         {
             _udpClient?.Close();
@@ -310,7 +400,6 @@ namespace sender
         }
     }
 
-    // Helper bridging WinRT D3D with SharpDX (moved verbatim from original)
     static class Direct3D11Helper
     {
         [ComImport]
