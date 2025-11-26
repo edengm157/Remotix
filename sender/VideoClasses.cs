@@ -37,7 +37,6 @@ namespace sender
 
         public VideoEncoder()
         {
-            // נקה לוג ישן
             if (File.Exists(_logPath))
             {
                 File.Delete(_logPath);
@@ -74,7 +73,7 @@ namespace sender
                 encParams.sSpatialLayers[0].iSpatialBitrate = 5000000;
 
                 encParams.bEnableFrameSkip = false;
-                encParams.uiIntraPeriod = 30; // Keyframe every 2 seconds
+                encParams.uiIntraPeriod = 30;
 
                 _videoEnc.Initialize(encParams);
 
@@ -138,39 +137,43 @@ namespace sender
 
                             if (encodedBytes != null && encodedBytes.Length > 0)
                             {
-                                // חלץ SPS/PPS בפעם הראשונה
+                                // 🔧 FIX: חלץ SPS/PPS מהפריים הראשון
                                 if (_sentFrames == 0)
                                 {
                                     ExtractSPSPPS(encodedBytes);
+
+                                    if (_nalCache.Count == 0)
+                                    {
+                                        WriteLog("⚠️ WARNING: No SPS/PPS found in first frame!");
+                                    }
                                 }
 
-                                // הוסף SPS/PPS לפריים הראשון וכל 30 פריימים (keyframes)
+                                // 🔧 FIX: בדוק אם זה keyframe (IDR)
+                                bool isKeyframe = IsKeyframe(encodedBytes);
+
                                 byte[] dataToSend = encodedBytes;
-                                if (_nalCache.Count > 0 && (_sentFrames % 30 == 0 || _sentFrames == 0))
+
+                                // 🔧 FIX: הוסף SPS/PPS לכל keyframe
+                                if (_nalCache.Count > 0 && (_sentFrames == 0 || isKeyframe))
                                 {
                                     using (var ms = new MemoryStream())
                                     {
-                                        // כתוב SPS/PPS קודם
                                         foreach (var nal in _nalCache)
                                         {
                                             ms.Write(nal, 0, nal.Length);
                                         }
-                                        // כתוב את הפריים
                                         ms.Write(encodedBytes, 0, encodedBytes.Length);
                                         dataToSend = ms.ToArray();
                                     }
 
-                                    if (_sentFrames == 0)
+                                    WriteLog($"🎬 Keyframe with SPS/PPS: {dataToSend.Length} bytes (frame #{_sentFrames})");
+
+                                    dispatcher?.Invoke(() =>
                                     {
-                                        WriteLog($"🎬 First frame with SPS/PPS headers: {dataToSend.Length} bytes");
-                                        dispatcher?.Invoke(() =>
-                                        {
-                                            statusCallback?.Invoke($"First frame with headers: {dataToSend.Length} bytes");
-                                        });
-                                    }
+                                        statusCallback?.Invoke($"Sent keyframe with headers: {dataToSend.Length} bytes");
+                                    });
                                 }
 
-                                // שלח בחלקים + לוג
                                 SendFrameInChunks(dataToSend, udpClient, remoteTarget);
 
                                 _sentFrames++;
@@ -202,6 +205,22 @@ namespace sender
             }
         }
 
+        private bool IsKeyframe(byte[] data)
+        {
+            for (int i = 0; i < data.Length - 4; i++)
+            {
+                if (data[i] == 0x00 && data[i + 1] == 0x00 && data[i + 2] == 0x00 && data[i + 3] == 0x01)
+                {
+                    int nalType = data[i + 4] & 0x1F;
+                    if (nalType == 5)
+                    {
+                        return true;
+                    }
+                }
+            }
+            return false;
+        }
+
         private void SendFrameInChunks(byte[] frameData, UdpClient udpClient, IPEndPoint remoteTarget)
         {
             if (frameData == null || frameData.Length == 0)
@@ -220,7 +239,6 @@ namespace sender
                 int payloadSize = Math.Min(MAX_PAYLOAD_SIZE, frameData.Length - offset);
                 bool isLastChunk = (chunkIndex == totalChunks - 1);
 
-                // צור חבילה: [payloadSize(4)][isLastChunk(1)][payload]
                 byte[] packet = new byte[HEADER_SIZE + payloadSize];
 
                 BitConverter.GetBytes(payloadSize).CopyTo(packet, 0);
@@ -232,7 +250,6 @@ namespace sender
                 {
                     int bytesSent = udpClient.Send(packet, packet.Length, remoteTarget);
 
-                    // לוג רק לחלק הראשון והאחרון
                     if (chunkIndex == 0 || chunkIndex == totalChunks - 1)
                     {
                         WriteLog($"  ✅ Chunk {chunkIndex + 1}/{totalChunks}: sent {bytesSent} bytes (payload: {payloadSize}, isLast: {isLastChunk})");
@@ -256,7 +273,7 @@ namespace sender
                 {
                     int nalType = data[i + 4] & 0x1F;
 
-                    if (nalType == 7 || nalType == 8) // SPS או PPS
+                    if (nalType == 7 || nalType == 8)
                     {
                         int nalEnd = i + 4;
                         for (int j = i + 4; j < data.Length - 3; j++)
@@ -287,7 +304,6 @@ namespace sender
             }
             catch
             {
-                // התעלם משגיאות בכתיבת לוג
             }
         }
 
@@ -404,9 +420,8 @@ namespace sender
 
                 FrameReady?.Invoke(texture, texture.Description);
             }
-            catch (Exception frameErr)
+            catch (Exception)
             {
-                // התעלם משגיאות בלכידת פריימים
             }
         }
 
