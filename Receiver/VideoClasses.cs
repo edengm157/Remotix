@@ -17,10 +17,13 @@ namespace Receiver
     internal class VideoDecoder : IDisposable
     {
         private H264Decoder _videoDecoder;
+        private RgbImage _decodedImage;  // 🔧 FIX: Pre-allocate the image buffer
         private int _receivedFrames = 0;
         private long _totalBytesReceived = 0;
         private int _failedDecodes = 0;
         private int _skippedFrames = 0;
+        private int _imageWidth = 1920;   // Will be updated on first decode
+        private int _imageHeight = 1008;
 
         public event Action<BitmapSource> FrameDecoded;
 
@@ -40,7 +43,20 @@ namespace Receiver
             try
             {
                 _videoDecoder = new H264Decoder();
-                LogToFile("✅ Decoder created successfully");
+
+                // 🔧 FIX: H264Sharp decoder MUST be initialized with parameters
+                var decParam = new TagSVCDecodingParam();
+                decParam.uiTargetDqLayer = 0xff;
+                decParam.eEcActiveIdc = ERROR_CON_IDC.ERROR_CON_SLICE_COPY;
+                decParam.sVideoProperty.eVideoBsType = VIDEO_BITSTREAM_TYPE.VIDEO_BITSTREAM_AVC;
+
+                _videoDecoder.Initialize(decParam);
+
+                // 🔧 FIX: Pre-allocate the image buffer
+                // We'll reallocate if size is different
+                _decodedImage = new RgbImage(ImageFormat.Bgr, _imageWidth, _imageHeight);
+
+                LogToFile($"✅ H264Sharp decoder initialized with AVC parameters, buffer: {_imageWidth}x{_imageHeight}");
 
                 dispatcher?.Invoke(() =>
                 {
@@ -70,7 +86,7 @@ namespace Receiver
             {
                 LogToFile($"📥 Attempting to decode frame: {encodedData.Length} bytes");
 
-                // 🔧 FIX: בדוק אם יש SPS/PPS בפריים
+                // Analyze NAL structure
                 bool hasSPS = false;
                 bool hasPPS = false;
                 bool hasIDR = false;
@@ -90,7 +106,7 @@ namespace Receiver
 
                 LogToFile($"Frame analysis: SPS={hasSPS}, PPS={hasPPS}, IDR={hasIDR}");
 
-                // 🔧 FIX: דלג על פריימים שאינם keyframes עד שמגיע הראשון
+                // Skip non-keyframes until we get the first keyframe
                 if (_receivedFrames == 0 && (!hasSPS || !hasPPS || !hasIDR))
                 {
                     _skippedFrames++;
@@ -106,43 +122,55 @@ namespace Receiver
                     return;
                 }
 
-                RgbImage decodedImage = null;
-
-                // נסה לפענח את הפריים
+                // 🔧 FIX: Decode into pre-allocated buffer
                 LogToFile("🔄 Calling Decode...");
-                bool decodeResult = _videoDecoder.Decode(encodedData, 0, encodedData.Length, noDelay: true, out DecodingState ds, ref decodedImage);
+                bool decodeResult = _videoDecoder.Decode(
+                    encodedData,
+                    0,
+                    encodedData.Length,
+                    noDelay: true,
+                    out DecodingState ds,
+                    ref _decodedImage);
 
-                LogToFile($"Decode result: {decodeResult}, DecodingState: {ds}, Image: {(decodedImage != null ? $"{decodedImage.Width}x{decodedImage.Height}" : "null")}");
+                LogToFile($"Decode result: {decodeResult}, DecodingState: {ds}");
 
-                if (decodeResult && decodedImage != null)
+                if (decodeResult && _decodedImage != null)
                 {
                     _receivedFrames++;
                     _totalBytesReceived += encodedData.Length;
                     _failedDecodes = 0;
-                    _skippedFrames = 0; // אפס כי התחלנו לקבל פריימים
+                    _skippedFrames = 0;
 
-                    LogToFile($"✅ Successfully decoded frame #{_receivedFrames}: {decodedImage.Width}x{decodedImage.Height}, format: {decodedImage.Format}");
+                    // Check if image size changed (shouldn't happen but be safe)
+                    if (_decodedImage.Width != _imageWidth || _decodedImage.Height != _imageHeight)
+                    {
+                        _imageWidth = _decodedImage.Width;
+                        _imageHeight = _decodedImage.Height;
+                        LogToFile($"📐 Image size changed to {_imageWidth}x{_imageHeight}");
+                    }
+
+                    LogToFile($"✅ Successfully decoded frame #{_receivedFrames}: {_decodedImage.Width}x{_decodedImage.Height}");
 
                     dispatcher?.Invoke(() =>
                     {
                         try
                         {
-                            var bitmapSource = RgbImageToWriteableBitmap(decodedImage);
+                            var bitmapSource = RgbImageToWriteableBitmap(_decodedImage);
                             LogToFile($"✅ Converted to WriteableBitmap: {bitmapSource.PixelWidth}x{bitmapSource.PixelHeight}");
 
                             FrameDecoded?.Invoke(bitmapSource);
                             LogToFile("✅ FrameDecoded event invoked");
 
-                            // עדכן סטטוס כל 15 פריימים
+                            // Update status periodically
                             if (_receivedFrames % 15 == 0)
                             {
                                 statusCallback?.Invoke($"Decoded {_receivedFrames} frames | " +
-                                    $"{decodedImage.Width}x{decodedImage.Height} | " +
+                                    $"{_decodedImage.Width}x{_decodedImage.Height} | " +
                                     $"Received {_totalBytesReceived / 1024.0 / 1024.0:F2}MB");
                             }
                             else if (_receivedFrames == 1)
                             {
-                                statusCallback?.Invoke($"✅ First frame decoded! {decodedImage.Width}x{decodedImage.Height}");
+                                statusCallback?.Invoke($"✅ First frame decoded! {_decodedImage.Width}x{_decodedImage.Height}");
                             }
                         }
                         catch (Exception convErr)
@@ -155,9 +183,9 @@ namespace Receiver
                 else
                 {
                     _failedDecodes++;
-                    LogToFile($"❌ Decode FAILED: state={ds}, hasImage={decodedImage != null}, dataSize={encodedData.Length}");
+                    LogToFile($"❌ Decode returned false: state={ds}, dataSize={encodedData.Length}");
 
-                    // לוג את הבתים הראשונים לבדיקה
+                    // Log details for first few failures
                     if (_failedDecodes <= 3)
                     {
                         string firstBytes = BitConverter.ToString(encodedData, 0, Math.Min(50, encodedData.Length));
@@ -186,7 +214,7 @@ namespace Receiver
             int height = img.Height;
             int strideSrc = img.Stride;
 
-            LogToFile($"Converting image: {width}x{height}, stride: {strideSrc}, format: {img.Format}, isManaged: {img.IsManaged}");
+            LogToFile($"Converting image: {width}x{height}, stride: {strideSrc}, format: {img.Format}");
 
             var wb = new WriteableBitmap(
                 width,
@@ -200,15 +228,12 @@ namespace Receiver
             int strideDst = wb.BackBufferStride;
             int bytesPerRow = width * 3;
 
-            LogToFile($"Destination stride: {strideDst}, bytesPerRow: {bytesPerRow}");
-
             unsafe
             {
                 byte* dst = (byte*)wb.BackBuffer;
 
                 if (img.IsManaged && img.ManagedBytes != null)
                 {
-                    LogToFile("Using managed bytes path");
                     fixed (byte* srcPtr = img.ManagedBytes)
                     {
                         byte* src = srcPtr + img.dataOffset;
@@ -232,7 +257,6 @@ namespace Receiver
                 }
                 else
                 {
-                    LogToFile("Using native bytes path");
                     byte* src = (byte*)(img.NativeBytes + img.dataOffset);
 
                     if (strideSrc == strideDst)
@@ -269,13 +293,18 @@ namespace Receiver
             }
             catch
             {
-                // התעלם משגיאות בכתיבת לוג
+                // Ignore logging errors
             }
         }
 
         public void DisposeDecoder()
         {
             LogToFile("🛑 Decoder disposed");
+
+            // Dispose the image buffer
+            _decodedImage?.Dispose();
+            _decodedImage = null;
+
             _videoDecoder?.Dispose();
             _videoDecoder = null;
         }
@@ -293,7 +322,7 @@ namespace Receiver
         private Task _receiveTask;
         private int _port;
 
-        private byte[] _frameBuffer = new byte[10 * 1024 * 1024]; // 10MB buffer
+        private byte[] _frameBuffer = new byte[10 * 1024 * 1024];
         private int _frameBufferPosition = 0;
         private int _receivedChunks = 0;
         private int _totalFramesReceived = 0;
@@ -320,7 +349,7 @@ namespace Receiver
             {
                 _port = port;
                 _udpClient = new UdpClient(_port);
-                _udpClient.Client.ReceiveBufferSize = 1024 * 1024; // 1MB buffer
+                _udpClient.Client.ReceiveBufferSize = 1024 * 1024;
 
                 LogToFile($"✅ UDP socket created on port {_port}");
 
@@ -366,7 +395,6 @@ namespace Receiver
                         continue;
                     }
 
-                    // Parse header: [payloadSize(4)][isLastChunk(1)][payload]
                     int payloadSize = BitConverter.ToInt32(packet, 0);
                     bool isLastChunk = packet[4] == 1;
 
@@ -376,7 +404,6 @@ namespace Receiver
                         continue;
                     }
 
-                    // Copy payload to frame buffer
                     if (_frameBufferPosition + payloadSize > _frameBuffer.Length)
                     {
                         LogToFile($"❌ Frame buffer overflow! Resetting.");
@@ -389,30 +416,25 @@ namespace Receiver
                     _frameBufferPosition += payloadSize;
                     _receivedChunks++;
 
-                    // Log first and last chunks only
                     if (_receivedChunks == 1 || isLastChunk)
                     {
                         LogToFile($"  📦 Chunk {_receivedChunks}: received {payloadSize} bytes, isLast={isLastChunk}");
                     }
 
-                    // If this is the last chunk, process the complete frame
                     if (isLastChunk)
                     {
                         _totalFramesReceived++;
 
                         LogToFile($"✅ Complete frame received: {_receivedChunks} chunks, {_frameBufferPosition} total bytes");
 
-                        // Extract frame data
                         byte[] frameData = new byte[_frameBufferPosition];
                         Buffer.BlockCopy(_frameBuffer, 0, frameData, 0, _frameBufferPosition);
 
-                        // Notify decoder
                         EncodedDataReceived?.Invoke(frameData);
 
                         LogToFile($"📤 Frame #{_totalFramesReceived} sent to decoder");
                         LogToFile("────────────────────────────────────────");
 
-                        // Reset for next frame
                         _frameBufferPosition = 0;
                         _receivedChunks = 0;
                     }
@@ -449,7 +471,6 @@ namespace Receiver
             }
             catch
             {
-                // Ignore logging errors
             }
         }
 

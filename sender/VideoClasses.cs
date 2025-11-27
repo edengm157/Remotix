@@ -22,7 +22,7 @@ namespace sender
     {
         private H264Encoder _videoEnc;
         private byte[] _scratchFrame;
-        private List<byte[]> _nalCache = new List<byte[]>();
+        private byte[] _bgrFrame;  // For converted BGR data
 
         private long _totalBytes = 0;
         private int _sentFrames = 0;
@@ -77,10 +77,11 @@ namespace sender
 
                 _videoEnc.Initialize(encParams);
 
-                int rawSize = w * h * 4;
+                int rawSize = w * h * 4;  // BGRA
                 _scratchFrame = new byte[rawSize];
+                _bgrFrame = new byte[w * h * 3];  // BGR (no alpha)
 
-                WriteLog($"✅ Encoder ready: {w}x{h}@15fps");
+                WriteLog($"✅ Encoder ready: {w}x{h}@15fps, BGR encoding");
 
                 dispatcher?.Invoke(() =>
                 {
@@ -118,6 +119,7 @@ namespace sender
                         var p = (byte*)mapped.DataPointer;
                         int strideBytes = d.Width * 4;
 
+                        // Copy BGRA data to scratch buffer
                         for (int y = 0; y < d.Height; y++)
                         {
                             Marshal.Copy((IntPtr)(p + y * mapped.RowPitch),
@@ -127,63 +129,32 @@ namespace sender
                         }
                     }
 
+                    // Convert BGRA to BGR (remove alpha channel)
+                    ConvertBgraToBgr(_scratchFrame, _bgrFrame, d.Width, d.Height);
+
+                    // Still pass BGRA for preview display
                     FrameDataReady?.Invoke(_scratchFrame, d.Width, d.Height);
 
-                    using (var rgb = new RgbImage(H264Sharp.ImageFormat.Bgra, d.Width, d.Height, _scratchFrame))
+                    // Encode using BGR (3 bytes per pixel)
+                    using (var bgr = new RgbImage(ImageFormat.Bgr, d.Width, d.Height, _bgrFrame))
                     {
-                        if (_videoEnc.Encode(rgb, out var outFrames))
+                        if (_videoEnc.Encode(bgr, out var outFrames))
                         {
                             byte[] encodedBytes = outFrames.GetAllBytes();
 
                             if (encodedBytes != null && encodedBytes.Length > 0)
                             {
-                                // 🔧 FIX: חלץ SPS/PPS מהפריים הראשון
-                                if (_sentFrames == 0)
-                                {
-                                    ExtractSPSPPS(encodedBytes);
-
-                                    if (_nalCache.Count == 0)
-                                    {
-                                        WriteLog("⚠️ WARNING: No SPS/PPS found in first frame!");
-                                    }
-                                }
-
-                                // 🔧 FIX: בדוק אם זה keyframe (IDR)
-                                bool isKeyframe = IsKeyframe(encodedBytes);
-
-                                byte[] dataToSend = encodedBytes;
-
-                                // 🔧 FIX: הוסף SPS/PPS לכל keyframe
-                                if (_nalCache.Count > 0 && (_sentFrames == 0 || isKeyframe))
-                                {
-                                    using (var ms = new MemoryStream())
-                                    {
-                                        foreach (var nal in _nalCache)
-                                        {
-                                            ms.Write(nal, 0, nal.Length);
-                                        }
-                                        ms.Write(encodedBytes, 0, encodedBytes.Length);
-                                        dataToSend = ms.ToArray();
-                                    }
-
-                                    WriteLog($"🎬 Keyframe with SPS/PPS: {dataToSend.Length} bytes (frame #{_sentFrames})");
-
-                                    dispatcher?.Invoke(() =>
-                                    {
-                                        statusCallback?.Invoke($"Sent keyframe with headers: {dataToSend.Length} bytes");
-                                    });
-                                }
-
-                                SendFrameInChunks(dataToSend, udpClient, remoteTarget);
+                                AnalyzeEncodedFrame(encodedBytes, outFrames.Length);
+                                SendFrameInChunks(encodedBytes, udpClient, remoteTarget);
 
                                 _sentFrames++;
-                                _totalBytes += dataToSend.Length;
+                                _totalBytes += encodedBytes.Length;
 
                                 if (_sentFrames % 15 == 0 || _sentFrames <= 3)
                                 {
                                     dispatcher?.Invoke(() =>
                                     {
-                                        statusCallback?.Invoke($"Frame #{_sentFrames} | {dataToSend.Length} bytes | Total {_totalBytes / 1024.0 / 1024.0:F2}MB");
+                                        statusCallback?.Invoke($"Frame #{_sentFrames} | {encodedBytes.Length} bytes | Total {_totalBytes / 1024.0 / 1024.0:F2}MB");
                                     });
                                 }
                             }
@@ -205,20 +176,53 @@ namespace sender
             }
         }
 
-        private bool IsKeyframe(byte[] data)
+        private void ConvertBgraToBgr(byte[] bgra, byte[] bgr, int width, int height)
         {
+            // Simply strip the alpha channel
+            // BGRA: B G R A B G R A ...
+            // BGR:  B G R B G R ...
+            int bgraIdx = 0;
+            int bgrIdx = 0;
+
+            for (int i = 0; i < width * height; i++)
+            {
+                bgr[bgrIdx++] = bgra[bgraIdx++]; // B
+                bgr[bgrIdx++] = bgra[bgraIdx++]; // G
+                bgr[bgrIdx++] = bgra[bgraIdx++]; // R
+                bgraIdx++; // Skip A
+            }
+        }
+
+        private void AnalyzeEncodedFrame(byte[] data, int numEncodedData)
+        {
+            bool hasSPS = false;
+            bool hasPPS = false;
+            bool hasIDR = false;
+            bool hasP = false;
+
             for (int i = 0; i < data.Length - 4; i++)
             {
-                if (data[i] == 0x00 && data[i + 1] == 0x00 && data[i + 2] == 0x00 && data[i + 3] == 0x01)
+                if (data[i] == 0x00 && data[i + 1] == 0x00 &&
+                    data[i + 2] == 0x00 && data[i + 3] == 0x01)
                 {
                     int nalType = data[i + 4] & 0x1F;
-                    if (nalType == 5)
-                    {
-                        return true;
-                    }
+
+                    if (nalType == 7) hasSPS = true;
+                    if (nalType == 8) hasPPS = true;
+                    if (nalType == 5) hasIDR = true;
+                    if (nalType == 1) hasP = true;
                 }
             }
-            return false;
+
+            string frameType = hasIDR ? "IDR (Keyframe)" : hasP ? "P-frame" : "Unknown";
+            string nalInfo = $"SPS={hasSPS}, PPS={hasPPS}, IDR={hasIDR}, P={hasP}";
+
+            WriteLog($"📊 Frame #{_sentFrames + 1}: {frameType} | {data.Length} bytes | EncodedData count: {numEncodedData} | NALs: {nalInfo}");
+
+            if (hasIDR && (hasSPS || hasPPS))
+            {
+                WriteLog($"   ✅ H264Sharp automatically included SPS/PPS with IDR frame");
+            }
         }
 
         private void SendFrameInChunks(byte[] frameData, UdpClient udpClient, IPEndPoint remoteTarget)
@@ -231,7 +235,7 @@ namespace sender
 
             int totalChunks = (int)Math.Ceiling((double)frameData.Length / MAX_PAYLOAD_SIZE);
 
-            WriteLog($"📤 Frame #{_sentFrames + 1}: {frameData.Length} bytes → {totalChunks} chunks to {remoteTarget}");
+            WriteLog($"📤 Sending frame: {frameData.Length} bytes → {totalChunks} chunks to {remoteTarget}");
 
             for (int chunkIndex = 0; chunkIndex < totalChunks; chunkIndex++)
             {
@@ -263,37 +267,6 @@ namespace sender
 
             WriteLog($"✅ Frame #{_sentFrames + 1} sent: {totalChunks} chunks");
             WriteLog("─────────────────────────────────────────");
-        }
-
-        private void ExtractSPSPPS(byte[] data)
-        {
-            for (int i = 0; i < data.Length - 4; i++)
-            {
-                if (data[i] == 0x00 && data[i + 1] == 0x00 && data[i + 2] == 0x00 && data[i + 3] == 0x01)
-                {
-                    int nalType = data[i + 4] & 0x1F;
-
-                    if (nalType == 7 || nalType == 8)
-                    {
-                        int nalEnd = i + 4;
-                        for (int j = i + 4; j < data.Length - 3; j++)
-                        {
-                            if (data[j] == 0x00 && data[j + 1] == 0x00 && data[j + 2] == 0x00 && data[j + 3] == 0x01)
-                            {
-                                nalEnd = j;
-                                break;
-                            }
-                        }
-                        if (nalEnd == i + 4) nalEnd = data.Length;
-
-                        byte[] nal = new byte[nalEnd - i];
-                        System.Buffer.BlockCopy(data, i, nal, 0, nal.Length);
-                        _nalCache.Add(nal);
-
-                        WriteLog($"📋 Extracted NAL type {nalType} ({(nalType == 7 ? "SPS" : "PPS")}): {nal.Length} bytes");
-                    }
-                }
-            }
         }
 
         private void WriteLog(string message)
