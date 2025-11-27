@@ -216,11 +216,13 @@ namespace Receiver
 
             LogToFile($"Converting image: {width}x{height}, stride: {strideSrc}, format: {img.Format}");
 
+            // 🔧 FIX: H264Sharp returns RGB, but WPF expects BGR
+            // So we need to swap R and B channels
             var wb = new WriteableBitmap(
                 width,
                 height,
                 96, 96,
-                PixelFormats.Bgr24,
+                PixelFormats.Bgr24,  // WPF format
                 null);
 
             wb.Lock();
@@ -238,19 +240,21 @@ namespace Receiver
                     {
                         byte* src = srcPtr + img.dataOffset;
 
-                        if (strideSrc == strideDst)
+                        // Copy with RGB->BGR conversion
+                        for (int y = 0; y < height; y++)
                         {
-                            Buffer.MemoryCopy(src, dst, strideDst * height, strideDst * height);
-                        }
-                        else
-                        {
-                            for (int y = 0; y < height; y++)
+                            byte* srcRow = src + y * strideSrc;
+                            byte* dstRow = dst + y * strideDst;
+
+                            for (int x = 0; x < width; x++)
                             {
-                                Buffer.MemoryCopy(
-                                    src + y * strideSrc,
-                                    dst + y * strideDst,
-                                    strideDst,
-                                    bytesPerRow);
+                                int srcIdx = x * 3;
+                                int dstIdx = x * 3;
+
+                                // RGB -> BGR swap
+                                dstRow[dstIdx + 0] = srcRow[srcIdx + 2]; // B = R
+                                dstRow[dstIdx + 1] = srcRow[srcIdx + 1]; // G = G
+                                dstRow[dstIdx + 2] = srcRow[srcIdx + 0]; // R = B
                             }
                         }
                     }
@@ -259,19 +263,21 @@ namespace Receiver
                 {
                     byte* src = (byte*)(img.NativeBytes + img.dataOffset);
 
-                    if (strideSrc == strideDst)
+                    // Copy with RGB->BGR conversion
+                    for (int y = 0; y < height; y++)
                     {
-                        Buffer.MemoryCopy(src, dst, strideDst * height, strideDst * height);
-                    }
-                    else
-                    {
-                        for (int y = 0; y < height; y++)
+                        byte* srcRow = src + y * strideSrc;
+                        byte* dstRow = dst + y * strideDst;
+
+                        for (int x = 0; x < width; x++)
                         {
-                            Buffer.MemoryCopy(
-                                src + y * strideSrc,
-                                dst + y * strideDst,
-                                strideDst,
-                                bytesPerRow);
+                            int srcIdx = x * 3;
+                            int dstIdx = x * 3;
+
+                            // RGB -> BGR swap
+                            dstRow[dstIdx + 0] = srcRow[srcIdx + 2]; // B = R
+                            dstRow[dstIdx + 1] = srcRow[srcIdx + 1]; // G = G
+                            dstRow[dstIdx + 2] = srcRow[srcIdx + 0]; // R = B
                         }
                     }
                 }
@@ -281,7 +287,7 @@ namespace Receiver
             wb.Unlock();
             wb.Freeze();
 
-            LogToFile("✅ WriteableBitmap conversion complete");
+            LogToFile("✅ WriteableBitmap conversion complete (RGB->BGR swapped)");
             return wb;
         }
 
