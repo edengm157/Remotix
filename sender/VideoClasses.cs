@@ -99,6 +99,16 @@ namespace sender
         {
             if (_videoEnc == null) return;
 
+            int expectedRawSize = desc.Width * desc.Height * 4;
+            int expectedBgrSize = desc.Width * desc.Height * 3;
+
+            if (_scratchFrame == null || _bgrFrame == null ||
+                _scratchFrame.Length != expectedRawSize || _bgrFrame.Length != expectedBgrSize)
+            {
+                WriteLog($"⚠️ Size mismatch! Frame: {desc.Width}x{desc.Height}, Buffer: {_scratchFrame?.Length ?? 0} bytes. Skipping frame.");
+                return;
+            }
+
             try
             {
                 var d = tex.Description;
@@ -301,6 +311,7 @@ namespace sender
         public SizeInt32? LastSize => _lastSize;
 
         public event Action<Texture2D, SharpDX.Direct3D11.Texture2DDescription> FrameReady;
+        public event Action<int, int> SizeChanged;
 
         private GraphicsCaptureItem _captureItem;
         private Direct3D11CaptureFramePool _framePool;
@@ -379,6 +390,8 @@ namespace sender
                 if (!_lastSize.HasValue || sz.Width != _lastSize.Value.Width || sz.Height != _lastSize.Value.Height)
                 {
                     _lastSize = sz;
+
+                    SizeChanged?.Invoke(sz.Width, sz.Height);
 
                     _framePool.Recreate(
                         _winRTDevice,
