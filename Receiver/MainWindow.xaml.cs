@@ -1,5 +1,8 @@
 ﻿using System;
+using System.Runtime.InteropServices;
 using System.Windows;
+using System.Windows.Controls;
+using System.Windows.Media;
 using System.Windows.Media.Imaging;
 
 namespace Receiver
@@ -8,6 +11,7 @@ namespace Receiver
     {
         private FrameReceiver _frameReceiver;
         private VideoDecoder _videoDecoder;
+        private WriteableBitmap _displayBitmap;
 
         public MainWindow()
         {
@@ -15,7 +19,14 @@ namespace Receiver
 
             Closed += MainWindow_Closed;
         }
-
+        private void InitializeDisplay(int width, int height)
+        {
+            Dispatcher.Invoke(() =>
+            {
+                _displayBitmap = new WriteableBitmap(width, height, 96, 96, PixelFormats.Bgr24, null);
+                DisplayImage.Source = _displayBitmap;
+            });
+        }
         private void StartButton_Click(object sender, RoutedEventArgs e)
         {
             try
@@ -44,6 +55,23 @@ namespace Receiver
                 _frameReceiver.EncodedDataReceived += OnEncodedDataReceived;
                 _videoDecoder.FrameDecoded += OnFrameDecoded;
 
+                // Handle size changes during streaming
+                // Handle size changes during streaming
+                // Handle size changes during streaming
+                _videoDecoder.SizeChanged += (width, height) =>
+                {
+                    Dispatcher.Invoke(() =>
+                    {
+                        StatusText.Text = $"Screen size changed to {width}x{height}, reinitializing...";
+
+                        // Clear old display
+                        DisplayImage.Source = null;
+                        _displayBitmap = null;
+                    });
+
+                    _videoDecoder.ReinitializeDecoder(width, height, Dispatcher, UpdateStatus);
+                };
+
                 // Start receiving
                 _frameReceiver.StartReceiving();
 
@@ -68,7 +96,31 @@ namespace Receiver
         {
             Dispatcher.Invoke(() =>
             {
-                DisplayImage.Source = bitmapSource;
+                // If bitmap doesn't exist or size changed, recreate it
+                if (_displayBitmap == null ||
+                    _displayBitmap.PixelWidth != bitmapSource.PixelWidth ||
+                    _displayBitmap.PixelHeight != bitmapSource.PixelHeight)
+                {
+                    InitializeDisplay(bitmapSource.PixelWidth, bitmapSource.PixelHeight);
+                }
+
+                // Copy the decoded frame to our persistent bitmap
+                try
+                {
+                    _displayBitmap.Lock();
+
+                    int stride = bitmapSource.PixelWidth * 3; // BGR24 = 3 bytes per pixel
+                    byte[] pixels = new byte[stride * bitmapSource.PixelHeight];
+                    bitmapSource.CopyPixels(pixels, stride, 0);
+
+                    Marshal.Copy(pixels, 0, _displayBitmap.BackBuffer, pixels.Length);
+
+                    _displayBitmap.AddDirtyRect(new Int32Rect(0, 0, bitmapSource.PixelWidth, bitmapSource.PixelHeight));
+                }
+                finally
+                {
+                    _displayBitmap.Unlock();
+                }
             });
         }
 
@@ -88,6 +140,7 @@ namespace Receiver
             if (_videoDecoder != null)
             {
                 _videoDecoder.FrameDecoded -= OnFrameDecoded;
+                _videoDecoder.SizeChanged -= null;
                 _videoDecoder.Dispose();
                 _videoDecoder = null;
             }
@@ -96,6 +149,7 @@ namespace Receiver
             Dispatcher.Invoke(() =>
             {
                 DisplayImage.Source = null;
+                _displayBitmap = null;
             });
 
             // Update UI
@@ -121,6 +175,7 @@ namespace Receiver
             if (_videoDecoder != null)
             {
                 _videoDecoder.FrameDecoded -= OnFrameDecoded;
+                _videoDecoder.SizeChanged -= null;
                 _videoDecoder.Dispose();
             }
         }

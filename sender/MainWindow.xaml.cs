@@ -101,6 +101,17 @@ namespace ScreenCaptureApp
                     _encoder.InitializeEncoder(sz.Value.Width, sz.Value.Height, this.Dispatcher, UpdateStatusFromEncoder);
                     InitializePreview(sz.Value.Width, sz.Value.Height);
                 }
+                _capturer.SizeChanged += (width, height) =>
+                {
+                    Dispatcher.Invoke(() =>
+                    {
+                        StatusText.Text = $"Screen size changed to {width}x{height}, reinitializing encoder...";
+                    });
+
+                    _encoder.DisposeEncoder();
+                    _encoder.InitializeEncoder(width, height, this.Dispatcher, UpdateStatusFromEncoder);
+                    InitializePreview(width, height);
+                };
 
                 // Update UI (same as original)
                 StartButton.IsEnabled = false;

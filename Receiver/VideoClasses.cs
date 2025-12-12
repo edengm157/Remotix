@@ -24,8 +24,11 @@ namespace Receiver
         private int _skippedFrames = 0;
         private int _imageWidth = 1920;   // Will be updated on first decode
         private int _imageHeight = 1008;
+        private bool _isReinitializing = false;
 
         public event Action<BitmapSource> FrameDecoded;
+
+        public event Action<int, int> SizeChanged;
 
         private readonly string _logPath = "receiver_decoder.log";
 
@@ -79,6 +82,12 @@ namespace Receiver
             if (_videoDecoder == null || encodedData == null || encodedData.Length == 0)
             {
                 LogToFile("❌ DecodeAndDisplayFrame: decoder is null or no data");
+                return;
+            }
+
+            if (_isReinitializing)
+            {
+                LogToFile("⏸️ Skipping frame during reinitialization");
                 return;
             }
 
@@ -144,9 +153,22 @@ namespace Receiver
                     // Check if image size changed (shouldn't happen but be safe)
                     if (_decodedImage.Width != _imageWidth || _decodedImage.Height != _imageHeight)
                     {
+                        int oldWidth = _imageWidth;
+                        int oldHeight = _imageHeight;
+
                         _imageWidth = _decodedImage.Width;
                         _imageHeight = _decodedImage.Height;
-                        LogToFile($"📐 Image size changed to {_imageWidth}x{_imageHeight}");
+
+                        LogToFile($"📐 Image size changed from {oldWidth}x{oldHeight} to {_imageWidth}x{_imageHeight}");
+
+                        // Notify that size changed so decoder can be reinitialized
+                        SizeChanged?.Invoke(_imageWidth, _imageHeight);
+
+                        // Reallocate the image buffer for new size
+                        _decodedImage?.Dispose();
+                        _decodedImage = new RgbImage(ImageFormat.Bgr, _imageWidth, _imageHeight);
+
+                        LogToFile($"✅ Decoder buffer reallocated for new size: {_imageWidth}x{_imageHeight}");
                     }
 
                     LogToFile($"✅ Successfully decoded frame #{_receivedFrames}: {_decodedImage.Width}x{_decodedImage.Height}");
@@ -216,11 +238,13 @@ namespace Receiver
 
             LogToFile($"Converting image: {width}x{height}, stride: {strideSrc}, format: {img.Format}");
 
+            // 🔧 FIX: H264Sharp returns RGB, but WPF expects BGR
+            // So we need to swap R and B channels
             var wb = new WriteableBitmap(
                 width,
                 height,
                 96, 96,
-                PixelFormats.Bgr24,
+                PixelFormats.Bgr24,  // WPF format
                 null);
 
             wb.Lock();
@@ -238,19 +262,21 @@ namespace Receiver
                     {
                         byte* src = srcPtr + img.dataOffset;
 
-                        if (strideSrc == strideDst)
+                        // Copy with RGB->BGR conversion
+                        for (int y = 0; y < height; y++)
                         {
-                            Buffer.MemoryCopy(src, dst, strideDst * height, strideDst * height);
-                        }
-                        else
-                        {
-                            for (int y = 0; y < height; y++)
+                            byte* srcRow = src + y * strideSrc;
+                            byte* dstRow = dst + y * strideDst;
+
+                            for (int x = 0; x < width; x++)
                             {
-                                Buffer.MemoryCopy(
-                                    src + y * strideSrc,
-                                    dst + y * strideDst,
-                                    strideDst,
-                                    bytesPerRow);
+                                int srcIdx = x * 3;
+                                int dstIdx = x * 3;
+
+                                // RGB -> BGR swap
+                                dstRow[dstIdx + 0] = srcRow[srcIdx + 2]; // B = R
+                                dstRow[dstIdx + 1] = srcRow[srcIdx + 1]; // G = G
+                                dstRow[dstIdx + 2] = srcRow[srcIdx + 0]; // R = B
                             }
                         }
                     }
@@ -259,19 +285,21 @@ namespace Receiver
                 {
                     byte* src = (byte*)(img.NativeBytes + img.dataOffset);
 
-                    if (strideSrc == strideDst)
+                    // Copy with RGB->BGR conversion
+                    for (int y = 0; y < height; y++)
                     {
-                        Buffer.MemoryCopy(src, dst, strideDst * height, strideDst * height);
-                    }
-                    else
-                    {
-                        for (int y = 0; y < height; y++)
+                        byte* srcRow = src + y * strideSrc;
+                        byte* dstRow = dst + y * strideDst;
+
+                        for (int x = 0; x < width; x++)
                         {
-                            Buffer.MemoryCopy(
-                                src + y * strideSrc,
-                                dst + y * strideDst,
-                                strideDst,
-                                bytesPerRow);
+                            int srcIdx = x * 3;
+                            int dstIdx = x * 3;
+
+                            // RGB -> BGR swap
+                            dstRow[dstIdx + 0] = srcRow[srcIdx + 2]; // B = R
+                            dstRow[dstIdx + 1] = srcRow[srcIdx + 1]; // G = G
+                            dstRow[dstIdx + 2] = srcRow[srcIdx + 0]; // R = B
                         }
                     }
                 }
@@ -281,8 +309,58 @@ namespace Receiver
             wb.Unlock();
             wb.Freeze();
 
-            LogToFile("✅ WriteableBitmap conversion complete");
+            LogToFile("✅ WriteableBitmap conversion complete (RGB->BGR swapped)");
             return wb;
+        }
+
+        public void ReinitializeDecoder(int newWidth, int newHeight, Dispatcher dispatcher = null, Action<string> statusCallback = null)
+        {
+            try
+            {
+                _isReinitializing = true;
+                LogToFile($"🔄 Reinitializing decoder for new size: {newWidth}x{newHeight}");
+
+                // Dispose old decoder
+                _videoDecoder?.Dispose();
+                _decodedImage?.Dispose();
+
+                // Reset frame count for new stream
+                _receivedFrames = 0;
+                _skippedFrames = 0;
+                _failedDecodes = 0;
+
+                // Update size
+                _imageWidth = newWidth;
+                _imageHeight = newHeight;
+
+                // Reinitialize decoder
+                _videoDecoder = new H264Decoder();
+
+                var decParam = new TagSVCDecodingParam();
+                decParam.uiTargetDqLayer = 0xff;
+                decParam.eEcActiveIdc = ERROR_CON_IDC.ERROR_CON_SLICE_COPY;
+                decParam.sVideoProperty.eVideoBsType = VIDEO_BITSTREAM_TYPE.VIDEO_BITSTREAM_AVC;
+
+                _videoDecoder.Initialize(decParam);
+
+                // Pre-allocate new image buffer
+                _decodedImage = new RgbImage(ImageFormat.Bgr, _imageWidth, _imageHeight);
+
+                LogToFile($"✅ Decoder reinitialized: {_imageWidth}x{_imageHeight}");
+
+                _isReinitializing = false;
+
+                dispatcher?.Invoke(() =>
+                {
+                    statusCallback?.Invoke($"Decoder reinitialized for {_imageWidth}x{_imageHeight}");
+                });
+            }
+            catch (Exception err)
+            {
+                _isReinitializing = false;
+                LogToFile($"❌ Decoder reinit error: {err.Message}");
+                throw;
+            }
         }
 
         private void LogToFile(string message)
