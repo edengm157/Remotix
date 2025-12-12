@@ -1,7 +1,6 @@
 ﻿using System;
 using System.Runtime.InteropServices;
 using System.Windows;
-using System.Windows.Controls;
 using System.Windows.Media;
 using System.Windows.Media.Imaging;
 
@@ -12,13 +11,14 @@ namespace Receiver
         private FrameReceiver _frameReceiver;
         private VideoDecoder _videoDecoder;
         private WriteableBitmap _displayBitmap;
+        private InputLogger _inputLogger; // מקליט פעולות ושולח אותן לסנדר
 
         public MainWindow()
         {
             InitializeComponent();
-
             Closed += MainWindow_Closed;
         }
+
         private void InitializeDisplay(int width, int height)
         {
             Dispatcher.Invoke(() =>
@@ -27,14 +27,13 @@ namespace Receiver
                 DisplayImage.Source = _displayBitmap;
             });
         }
+
         private void StartButton_Click(object sender, RoutedEventArgs e)
         {
             try
             {
-                // Use default port 12345 (matching sender)
                 int port = 12345;
 
-                // 🔧 FIX: Recreate objects if they were disposed
                 if (_frameReceiver == null)
                 {
                     _frameReceiver = new FrameReceiver();
@@ -45,26 +44,23 @@ namespace Receiver
                     _videoDecoder = new VideoDecoder();
                 }
 
-                // Initialize receiver on specified port
-                _frameReceiver.InitializeReceiver(port, Dispatcher, UpdateStatus);
+                // יצירת InputLogger
+                if (_inputLogger == null)
+                {
+                    _inputLogger = new InputLogger();
+                }
 
-                // Initialize decoder
+                _frameReceiver.InitializeReceiver(port, Dispatcher, UpdateStatus);
                 _videoDecoder.InitializeDecoder(Dispatcher, UpdateStatus);
 
-                // Wire up the pipeline: Receiver -> Decoder -> Display
                 _frameReceiver.EncodedDataReceived += OnEncodedDataReceived;
                 _videoDecoder.FrameDecoded += OnFrameDecoded;
 
-                // Handle size changes during streaming
-                // Handle size changes during streaming
-                // Handle size changes during streaming
                 _videoDecoder.SizeChanged += (width, height) =>
                 {
                     Dispatcher.Invoke(() =>
                     {
                         StatusText.Text = $"Screen size changed to {width}x{height}, reinitializing...";
-
-                        // Clear old display
                         DisplayImage.Source = null;
                         _displayBitmap = null;
                     });
@@ -72,13 +68,14 @@ namespace Receiver
                     _videoDecoder.ReinitializeDecoder(width, height, Dispatcher, UpdateStatus);
                 };
 
-                // Start receiving
                 _frameReceiver.StartReceiving();
 
-                // Update UI
+                // התחלת לוגינג ושליחת פעולות לסנדר
+                _inputLogger.StartLogging();
+
                 StartButton.IsEnabled = false;
                 StopButton.IsEnabled = true;
-                StatusText.Text = $"Listening on port {port}... Make sure sender is sending to localhost:{port}";
+                StatusText.Text = $"Listening on port {port} + sending input to remote (port 12346)";
             }
             catch (Exception ex)
             {
@@ -96,7 +93,6 @@ namespace Receiver
         {
             Dispatcher.Invoke(() =>
             {
-                // If bitmap doesn't exist or size changed, recreate it
                 if (_displayBitmap == null ||
                     _displayBitmap.PixelWidth != bitmapSource.PixelWidth ||
                     _displayBitmap.PixelHeight != bitmapSource.PixelHeight)
@@ -104,12 +100,11 @@ namespace Receiver
                     InitializeDisplay(bitmapSource.PixelWidth, bitmapSource.PixelHeight);
                 }
 
-                // Copy the decoded frame to our persistent bitmap
                 try
                 {
                     _displayBitmap.Lock();
 
-                    int stride = bitmapSource.PixelWidth * 3; // BGR24 = 3 bytes per pixel
+                    int stride = bitmapSource.PixelWidth * 3;
                     byte[] pixels = new byte[stride * bitmapSource.PixelHeight];
                     bitmapSource.CopyPixels(pixels, stride, 0);
 
@@ -126,9 +121,14 @@ namespace Receiver
 
         private void StopButton_Click(object sender, RoutedEventArgs e)
         {
-            // 🔧 FIX: Properly dispose and recreate for next start
+            // עצירת InputLogger
+            if (_inputLogger != null)
+            {
+                _inputLogger.StopLogging();
+                _inputLogger.Dispose();
+                _inputLogger = null;
+            }
 
-            // Unsubscribe from events first
             if (_frameReceiver != null)
             {
                 _frameReceiver.EncodedDataReceived -= OnEncodedDataReceived;
@@ -145,17 +145,15 @@ namespace Receiver
                 _videoDecoder = null;
             }
 
-            // Clear display
             Dispatcher.Invoke(() =>
             {
                 DisplayImage.Source = null;
                 _displayBitmap = null;
             });
 
-            // Update UI
             StartButton.IsEnabled = true;
             StopButton.IsEnabled = false;
-            StatusText.Text = "Stopped - ready to start again";
+            StatusText.Text = "🛑 Stopped - ready to start again";
         }
 
         private void UpdateStatus(string message)
@@ -165,7 +163,12 @@ namespace Receiver
 
         private void MainWindow_Closed(object sender, EventArgs e)
         {
-            // Clean up on window close
+            // ניקוי InputLogger
+            if (_inputLogger != null)
+            {
+                _inputLogger.Dispose();
+            }
+
             if (_frameReceiver != null)
             {
                 _frameReceiver.EncodedDataReceived -= OnEncodedDataReceived;

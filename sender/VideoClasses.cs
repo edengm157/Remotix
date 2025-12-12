@@ -327,7 +327,8 @@ namespace sender
         public FrameCapturer()
         {
             _udpClient = new UdpClient();
-            _remoteTarget = new IPEndPoint(IPAddress.Loopback, 12345);
+            //_remoteTarget = new IPEndPoint(IPAddress.Loopback, 12345);
+            _remoteTarget = new IPEndPoint(IPAddress.Parse("10.0.0.31"), 12345);
         }
 
         public void InitD3D()

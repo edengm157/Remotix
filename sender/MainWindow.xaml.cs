@@ -15,16 +15,17 @@ namespace ScreenCaptureApp
         private FrameCapturer _capturer;
         private VideoEncoder _encoder;
         private WriteableBitmap _previewBitmap;
-        private InputLogger _inputLogger;
+        private InputReceiver _inputReceiver;
 
         public MainWindow()
         {
             InitializeComponent();
-            _inputLogger = new InputLogger();
 
             // Create the objects — InitD3D moved into capturer
             _capturer = new FrameCapturer();
             _encoder = new VideoEncoder();
+            _inputReceiver = new InputReceiver();
+            _inputReceiver.Start();
 
             // Wire capturer -> encoder so capturer can forward frames to encoder
             _capturer.FrameReady += (tex, desc) =>
@@ -117,8 +118,6 @@ namespace ScreenCaptureApp
                 StartButton.IsEnabled = false;
                 StopButton.IsEnabled = true;
 
-                _inputLogger.StartLogging();
-
                 StatusText.Text = "Capture started; encoder warming up... (Input logging active)";
             }
             catch (Exception ex)
@@ -130,8 +129,6 @@ namespace ScreenCaptureApp
 
         private void StopButton_Click(object sender, RoutedEventArgs e)
         {
-            _inputLogger.StopLogging();
-
             // Stop capture + encoder
             _capturer.StopCapture();
             _encoder.DisposeEncoder();
@@ -150,12 +147,11 @@ namespace ScreenCaptureApp
 
         private void MainWindow_Closed(object sender, EventArgs e)
         {
-            _inputLogger?.Dispose();
-
             // Stop everything and dispose
             _capturer.StopCapture();
             _capturer.DisposeAll();
             _encoder.DisposeEncoder();
+            _inputReceiver?.Dispose();
         }
     }
 
