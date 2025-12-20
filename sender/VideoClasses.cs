@@ -22,7 +22,7 @@ namespace sender
     {
         private H264Encoder _videoEnc;
         private byte[] _scratchFrame;
-        private byte[] _bgrFrame;  // For converted BGR data
+        private byte[] _bgrFrame;
 
         private long _totalBytes = 0;
         private int _sentFrames = 0;
@@ -33,7 +33,18 @@ namespace sender
         private const int HEADER_SIZE = 5;
         private const int MAX_PAYLOAD_SIZE = MAX_PACKET_SIZE - HEADER_SIZE;
 
+        // Performance monitoring and adaptation
+        private PerformanceMonitor _performanceMonitor;
+        private AdaptiveQualityController _qualityController;
+        private bool _adaptiveQualityEnabled = true;
+        private System.Diagnostics.Stopwatch _frameTimer = new System.Diagnostics.Stopwatch();
+
         public event Action<byte[], int, int> FrameDataReady;
+        public event Action<PerformanceMonitor> MetricsUpdated;
+
+        // Expose monitoring
+        public PerformanceMonitor PerformanceMonitor => _performanceMonitor;
+        public AdaptiveQualityController QualityController => _qualityController;
 
         public VideoEncoder()
         {
@@ -41,7 +52,15 @@ namespace sender
             {
                 File.Delete(_logPath);
             }
-            WriteLog("🚀 VideoEncoder initialized - log started");
+            WriteLog("🚀 VideoEncoder initialized with performance monitoring");
+
+            _performanceMonitor = new PerformanceMonitor();
+            _qualityController = new AdaptiveQualityController(_performanceMonitor);
+
+            // Subscribe to quality changes
+            _qualityController.QualityAdjusted += OnQualityAdjusted;
+
+            _frameTimer.Start();
         }
 
         public void InitializeEncoder(int w, int h, Dispatcher dispatcher = null, Action<string> statusCallback = null)
@@ -57,8 +76,9 @@ namespace sender
                 encParams.iPicWidth = w;
                 encParams.iPicHeight = h;
 
-                encParams.iTargetBitrate = 5000000;
-                encParams.fMaxFrameRate = 15;
+                // Use adaptive quality controller's target bitrate and FPS
+                encParams.iTargetBitrate = _qualityController.TargetBitrate;
+                encParams.fMaxFrameRate = _qualityController.TargetFPS;
 
                 encParams.iUsageType = EUsageType.SCREEN_CONTENT_REAL_TIME;
                 encParams.iRCMode = RC_MODES.RC_BITRATE_MODE;
@@ -69,23 +89,24 @@ namespace sender
 
                 encParams.sSpatialLayers[0].iVideoWidth = w;
                 encParams.sSpatialLayers[0].iVideoHeight = h;
-                encParams.sSpatialLayers[0].fFrameRate = 15;
-                encParams.sSpatialLayers[0].iSpatialBitrate = 5000000;
+                encParams.sSpatialLayers[0].fFrameRate = _qualityController.TargetFPS;
+                encParams.sSpatialLayers[0].iSpatialBitrate = _qualityController.TargetBitrate;
 
                 encParams.bEnableFrameSkip = false;
                 encParams.uiIntraPeriod = 30;
 
                 _videoEnc.Initialize(encParams);
 
-                int rawSize = w * h * 4;  // BGRA
+                int rawSize = w * h * 4;
                 _scratchFrame = new byte[rawSize];
-                _bgrFrame = new byte[w * h * 3];  // BGR (no alpha)
+                _bgrFrame = new byte[w * h * 3];
 
-                WriteLog($"✅ Encoder ready: {w}x{h}@15fps, BGR encoding");
+                WriteLog($"✅ Encoder ready: {w}x{h}@{_qualityController.TargetFPS:F0}fps, " +
+                        $"{_qualityController.TargetBitrate / 1000000.0:F1}Mbps, BGR encoding");
 
                 dispatcher?.Invoke(() =>
                 {
-                    statusCallback?.Invoke($"Encoder ready {w}x{h}@15fps");
+                    statusCallback?.Invoke($"Encoder: {w}x{h} | {_qualityController.GetSettingsDescription()}");
                 });
             }
             catch (Exception initErr)
@@ -95,7 +116,9 @@ namespace sender
             }
         }
 
-        public void EncodeAndSendFrame(Texture2D tex, SharpDX.Direct3D11.Texture2DDescription desc, Device mainD3D, UdpClient udpClient, IPEndPoint remoteTarget, Dispatcher dispatcher = null, Action<string> statusCallback = null)
+        public void EncodeAndSendFrame(Texture2D tex, SharpDX.Direct3D11.Texture2DDescription desc,
+            Device mainD3D, UdpClient udpClient, IPEndPoint remoteTarget,
+            Dispatcher dispatcher = null, Action<string> statusCallback = null)
         {
             if (_videoEnc == null) return;
 
@@ -106,8 +129,11 @@ namespace sender
                 _scratchFrame.Length != expectedRawSize || _bgrFrame.Length != expectedBgrSize)
             {
                 WriteLog($"⚠️ Size mismatch! Frame: {desc.Width}x{desc.Height}, Buffer: {_scratchFrame?.Length ?? 0} bytes. Skipping frame.");
+                _performanceMonitor.RecordDroppedFrame();
                 return;
             }
+
+            long frameStartTime = _frameTimer.ElapsedMilliseconds;
 
             try
             {
@@ -129,7 +155,6 @@ namespace sender
                         var p = (byte*)mapped.DataPointer;
                         int strideBytes = d.Width * 4;
 
-                        // Copy BGRA data to scratch buffer
                         for (int y = 0; y < d.Height; y++)
                         {
                             Marshal.Copy((IntPtr)(p + y * mapped.RowPitch),
@@ -139,13 +164,9 @@ namespace sender
                         }
                     }
 
-                    // Convert BGRA to BGR (remove alpha channel)
                     ConvertBgraToBgr(_scratchFrame, _bgrFrame, d.Width, d.Height);
-
-                    // Still pass BGRA for preview display
                     FrameDataReady?.Invoke(_scratchFrame, d.Width, d.Height);
 
-                    // Encode using BGR (3 bytes per pixel)
                     using (var bgr = new RgbImage(ImageFormat.Bgr, d.Width, d.Height, _bgrFrame))
                     {
                         if (_videoEnc.Encode(bgr, out var outFrames))
@@ -154,20 +175,43 @@ namespace sender
 
                             if (encodedBytes != null && encodedBytes.Length > 0)
                             {
+                                long encodeTime = _frameTimer.ElapsedMilliseconds - frameStartTime;
+
                                 AnalyzeEncodedFrame(encodedBytes, outFrames.Length);
                                 SendFrameInChunks(encodedBytes, udpClient, remoteTarget);
 
                                 _sentFrames++;
                                 _totalBytes += encodedBytes.Length;
 
+                                // Record frame metrics
+                                _performanceMonitor.RecordFrame(encodedBytes.Length, encodeTime);
+
+                                // Check if quality adjustment is needed
+                                if (_adaptiveQualityEnabled && _qualityController.UpdateQuality())
+                                {
+                                    WriteLog($"🔧 Quality adjusted: {_qualityController.GetSettingsDescription()}");
+
+                                    // Re-initialize encoder with new settings
+                                    ReinitializeWithNewQuality(d.Width, d.Height, dispatcher, statusCallback);
+                                }
+
+                                // Update UI with metrics
                                 if (_sentFrames % 15 == 0 || _sentFrames <= 3)
                                 {
                                     dispatcher?.Invoke(() =>
                                     {
-                                        statusCallback?.Invoke($"Frame #{_sentFrames} | {encodedBytes.Length} bytes | Total {_totalBytes / 1024.0 / 1024.0:F2}MB");
+                                        string status = $"Frame #{_sentFrames} | {_performanceMonitor.GetQualityIndicator()} " +
+                                                      $"{_performanceMonitor.GetStatusString()}";
+                                        statusCallback?.Invoke(status);
                                     });
+
+                                    MetricsUpdated?.Invoke(_performanceMonitor);
                                 }
                             }
+                        }
+                        else
+                        {
+                            _performanceMonitor.RecordDroppedFrame();
                         }
                     }
                 }
@@ -179,6 +223,7 @@ namespace sender
             catch (Exception encErr)
             {
                 WriteLog($"❌ Encode error: {encErr.Message}");
+                _performanceMonitor.RecordDroppedFrame();
                 dispatcher?.Invoke(() =>
                 {
                     statusCallback?.Invoke($"Encoder issue: {encErr.Message}");
@@ -186,20 +231,69 @@ namespace sender
             }
         }
 
+        private void OnQualityAdjusted(int bitrate, float fps, QualityPreset preset)
+        {
+            WriteLog($"📊 Quality changed: {preset} | {bitrate / 1000000.0:F1} Mbps @ {fps:F0} FPS");
+        }
+
+        private void ReinitializeWithNewQuality(int width, int height, Dispatcher dispatcher, Action<string> statusCallback)
+        {
+            try
+            {
+                // Get current parameters
+                var encParams = _videoEnc.GetDefaultParameters();
+
+                // Update with new quality settings
+                encParams.iPicWidth = width;
+                encParams.iPicHeight = height;
+                encParams.iTargetBitrate = _qualityController.TargetBitrate;
+                encParams.fMaxFrameRate = _qualityController.TargetFPS;
+
+                encParams.iUsageType = EUsageType.SCREEN_CONTENT_REAL_TIME;
+                encParams.iRCMode = RC_MODES.RC_BITRATE_MODE;
+                encParams.iComplexityMode = ECOMPLEXITY_MODE.LOW_COMPLEXITY;
+
+                encParams.iTemporalLayerNum = 1;
+                encParams.iSpatialLayerNum = 1;
+
+                encParams.sSpatialLayers[0].iVideoWidth = width;
+                encParams.sSpatialLayers[0].iVideoHeight = height;
+                encParams.sSpatialLayers[0].fFrameRate = _qualityController.TargetFPS;
+                encParams.sSpatialLayers[0].iSpatialBitrate = _qualityController.TargetBitrate;
+
+                encParams.bEnableFrameSkip = false;
+                encParams.uiIntraPeriod = 30;
+
+                // Re-initialize encoder
+                _videoEnc.Dispose();
+                _videoEnc = new H264Encoder();
+                _videoEnc.Initialize(encParams);
+
+                WriteLog($"✅ Encoder re-initialized with new quality settings");
+            }
+            catch (Exception ex)
+            {
+                WriteLog($"❌ Failed to re-initialize encoder: {ex.Message}");
+            }
+        }
+
+        public void SetAdaptiveQuality(bool enabled)
+        {
+            _adaptiveQualityEnabled = enabled;
+            WriteLog($"🔧 Adaptive quality: {(enabled ? "ENABLED" : "DISABLED")}");
+        }
+
         private void ConvertBgraToBgr(byte[] bgra, byte[] bgr, int width, int height)
         {
-            // Simply strip the alpha channel
-            // BGRA: B G R A B G R A ...
-            // BGR:  B G R B G R ...
             int bgraIdx = 0;
             int bgrIdx = 0;
 
             for (int i = 0; i < width * height; i++)
             {
-                bgr[bgrIdx++] = bgra[bgraIdx++]; // B
-                bgr[bgrIdx++] = bgra[bgraIdx++]; // G
-                bgr[bgrIdx++] = bgra[bgraIdx++]; // R
-                bgraIdx++; // Skip A
+                bgr[bgrIdx++] = bgra[bgraIdx++];
+                bgr[bgrIdx++] = bgra[bgraIdx++];
+                bgr[bgrIdx++] = bgra[bgraIdx++];
+                bgraIdx++;
             }
         }
 
@@ -228,11 +322,6 @@ namespace sender
             string nalInfo = $"SPS={hasSPS}, PPS={hasPPS}, IDR={hasIDR}, P={hasP}";
 
             WriteLog($"📊 Frame #{_sentFrames + 1}: {frameType} | {data.Length} bytes | EncodedData count: {numEncodedData} | NALs: {nalInfo}");
-
-            if (hasIDR && (hasSPS || hasPPS))
-            {
-                WriteLog($"   ✅ H264Sharp automatically included SPS/PPS with IDR frame");
-            }
         }
 
         private void SendFrameInChunks(byte[] frameData, UdpClient udpClient, IPEndPoint remoteTarget)
@@ -244,8 +333,6 @@ namespace sender
             }
 
             int totalChunks = (int)Math.Ceiling((double)frameData.Length / MAX_PAYLOAD_SIZE);
-
-            WriteLog($"📤 Sending frame: {frameData.Length} bytes → {totalChunks} chunks to {remoteTarget}");
 
             for (int chunkIndex = 0; chunkIndex < totalChunks; chunkIndex++)
             {
@@ -262,21 +349,13 @@ namespace sender
 
                 try
                 {
-                    int bytesSent = udpClient.Send(packet, packet.Length, remoteTarget);
-
-                    if (chunkIndex == 0 || chunkIndex == totalChunks - 1)
-                    {
-                        WriteLog($"  ✅ Chunk {chunkIndex + 1}/{totalChunks}: sent {bytesSent} bytes (payload: {payloadSize}, isLast: {isLastChunk})");
-                    }
+                    udpClient.Send(packet, packet.Length, remoteTarget);
                 }
                 catch (Exception ex)
                 {
-                    WriteLog($"  ❌ FAILED chunk {chunkIndex + 1}: {ex.Message}");
+                    WriteLog($"❌ FAILED chunk {chunkIndex + 1}: {ex.Message}");
                 }
             }
-
-            WriteLog($"✅ Frame #{_sentFrames + 1} sent: {totalChunks} chunks");
-            WriteLog("─────────────────────────────────────────");
         }
 
         private void WriteLog(string message)
@@ -292,7 +371,7 @@ namespace sender
 
         public void DisposeEncoder()
         {
-            WriteLog("🛑 Encoder disposed");
+            WriteLog($"🛑 Encoder disposed. Final stats: {_performanceMonitor.GetStatusString()}");
             _videoEnc?.Dispose();
             _videoEnc = null;
         }
@@ -303,7 +382,7 @@ namespace sender
         }
     }
 
-    internal class FrameCapturer : IDisposable
+internal class FrameCapturer : IDisposable
     {
         public Device MainDevice => _mainD3D;
         public UdpClient UdpClient => _udpClient;

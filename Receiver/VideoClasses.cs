@@ -1,6 +1,5 @@
 ﻿using H264Sharp;
 using System;
-using System.Collections.Generic;
 using System.IO;
 using System.Net;
 using System.Net.Sockets;
@@ -17,20 +16,27 @@ namespace Receiver
     internal class VideoDecoder : IDisposable
     {
         private H264Decoder _videoDecoder;
-        private RgbImage _decodedImage;  // 🔧 FIX: Pre-allocate the image buffer
+        private RgbImage _decodedImage;
         private int _receivedFrames = 0;
         private long _totalBytesReceived = 0;
         private int _failedDecodes = 0;
         private int _skippedFrames = 0;
-        private int _imageWidth = 1920;   // Will be updated on first decode
+        private int _imageWidth = 1920;
         private int _imageHeight = 1008;
         private bool _isReinitializing = false;
 
-        public event Action<BitmapSource> FrameDecoded;
+        // Performance monitoring
+        private PerformanceMonitor _performanceMonitor;
+        private System.Diagnostics.Stopwatch _frameTimer = new System.Diagnostics.Stopwatch();
 
+        public event Action<BitmapSource> FrameDecoded;
         public event Action<int, int> SizeChanged;
+        public event Action<PerformanceMonitor> MetricsUpdated;
 
         private readonly string _logPath = "receiver_decoder.log";
+
+        // Expose monitoring
+        public PerformanceMonitor PerformanceMonitor => _performanceMonitor;
 
         public VideoDecoder()
         {
@@ -38,7 +44,10 @@ namespace Receiver
             {
                 File.Delete(_logPath);
             }
-            LogToFile("🚀 VideoDecoder initialized");
+            LogToFile("🚀 VideoDecoder initialized with performance monitoring");
+
+            _performanceMonitor = new PerformanceMonitor();
+            _frameTimer.Start();
         }
 
         public void InitializeDecoder(Dispatcher dispatcher = null, Action<string> statusCallback = null)
@@ -47,7 +56,6 @@ namespace Receiver
             {
                 _videoDecoder = new H264Decoder();
 
-                // 🔧 FIX: H264Sharp decoder MUST be initialized with parameters
                 var decParam = new TagSVCDecodingParam();
                 decParam.uiTargetDqLayer = 0xff;
                 decParam.eEcActiveIdc = ERROR_CON_IDC.ERROR_CON_SLICE_COPY;
@@ -55,8 +63,6 @@ namespace Receiver
 
                 _videoDecoder.Initialize(decParam);
 
-                // 🔧 FIX: Pre-allocate the image buffer
-                // We'll reallocate if size is different
                 _decodedImage = new RgbImage(ImageFormat.Bgr, _imageWidth, _imageHeight);
 
                 LogToFile($"✅ H264Sharp decoder initialized with AVC parameters, buffer: {_imageWidth}x{_imageHeight}");
@@ -82,14 +88,18 @@ namespace Receiver
             if (_videoDecoder == null || encodedData == null || encodedData.Length == 0)
             {
                 LogToFile("❌ DecodeAndDisplayFrame: decoder is null or no data");
+                _performanceMonitor.RecordDroppedFrame();
                 return;
             }
 
             if (_isReinitializing)
             {
                 LogToFile("⏸️ Skipping frame during reinitialization");
+                _performanceMonitor.RecordDroppedFrame();
                 return;
             }
+
+            long frameStartTime = _frameTimer.ElapsedMilliseconds;
 
             try
             {
@@ -120,6 +130,7 @@ namespace Receiver
                 {
                     _skippedFrames++;
                     LogToFile($"⏭️ Skipping non-keyframe #{_skippedFrames} (waiting for SPS+PPS+IDR)");
+                    _performanceMonitor.RecordDroppedFrame();
 
                     if (_skippedFrames % 10 == 0)
                     {
@@ -131,7 +142,6 @@ namespace Receiver
                     return;
                 }
 
-                // 🔧 FIX: Decode into pre-allocated buffer
                 LogToFile("🔄 Calling Decode...");
                 bool decodeResult = _videoDecoder.Decode(
                     encodedData,
@@ -141,7 +151,9 @@ namespace Receiver
                     out DecodingState ds,
                     ref _decodedImage);
 
-                LogToFile($"Decode result: {decodeResult}, DecodingState: {ds}");
+                long decodeTime = _frameTimer.ElapsedMilliseconds - frameStartTime;
+
+                LogToFile($"Decode result: {decodeResult}, DecodingState: {ds}, Time: {decodeTime}ms");
 
                 if (decodeResult && _decodedImage != null)
                 {
@@ -150,7 +162,10 @@ namespace Receiver
                     _failedDecodes = 0;
                     _skippedFrames = 0;
 
-                    // Check if image size changed (shouldn't happen but be safe)
+                    // Record metrics with latency
+                    _performanceMonitor.RecordFrame(encodedData.Length, decodeTime);
+
+                    // Check if image size changed
                     if (_decodedImage.Width != _imageWidth || _decodedImage.Height != _imageHeight)
                     {
                         int oldWidth = _imageWidth;
@@ -161,10 +176,8 @@ namespace Receiver
 
                         LogToFile($"📐 Image size changed from {oldWidth}x{oldHeight} to {_imageWidth}x{_imageHeight}");
 
-                        // Notify that size changed so decoder can be reinitialized
                         SizeChanged?.Invoke(_imageWidth, _imageHeight);
 
-                        // Reallocate the image buffer for new size
                         _decodedImage?.Dispose();
                         _decodedImage = new RgbImage(ImageFormat.Bgr, _imageWidth, _imageHeight);
 
@@ -183,12 +196,13 @@ namespace Receiver
                             FrameDecoded?.Invoke(bitmapSource);
                             LogToFile("✅ FrameDecoded event invoked");
 
-                            // Update status periodically
+                            // Update status with metrics
                             if (_receivedFrames % 15 == 0)
                             {
-                                statusCallback?.Invoke($"Decoded {_receivedFrames} frames | " +
-                                    $"{_decodedImage.Width}x{_decodedImage.Height} | " +
-                                    $"Received {_totalBytesReceived / 1024.0 / 1024.0:F2}MB");
+                                string status = $"{_performanceMonitor.GetQualityIndicator()} {_performanceMonitor.GetStatusString()}";
+                                statusCallback?.Invoke(status);
+
+                                MetricsUpdated?.Invoke(_performanceMonitor);
                             }
                             else if (_receivedFrames == 1)
                             {
@@ -205,9 +219,9 @@ namespace Receiver
                 else
                 {
                     _failedDecodes++;
+                    _performanceMonitor.RecordDroppedFrame();
                     LogToFile($"❌ Decode returned false: state={ds}, dataSize={encodedData.Length}");
 
-                    // Log details for first few failures
                     if (_failedDecodes <= 3)
                     {
                         string firstBytes = BitConverter.ToString(encodedData, 0, Math.Min(50, encodedData.Length));
@@ -223,6 +237,7 @@ namespace Receiver
             catch (Exception decErr)
             {
                 LogToFile($"❌ Decoder exception: {decErr.Message}\n{decErr.StackTrace}");
+                _performanceMonitor.RecordDroppedFrame();
                 dispatcher?.Invoke(() =>
                 {
                     statusCallback?.Invoke($"Decoder error: {decErr.Message}");
@@ -238,19 +253,16 @@ namespace Receiver
 
             LogToFile($"Converting image: {width}x{height}, stride: {strideSrc}, format: {img.Format}");
 
-            // 🔧 FIX: H264Sharp returns RGB, but WPF expects BGR
-            // So we need to swap R and B channels
             var wb = new WriteableBitmap(
                 width,
                 height,
                 96, 96,
-                PixelFormats.Bgr24,  // WPF format
+                PixelFormats.Bgr24,
                 null);
 
             wb.Lock();
 
             int strideDst = wb.BackBufferStride;
-            int bytesPerRow = width * 3;
 
             unsafe
             {
@@ -262,7 +274,6 @@ namespace Receiver
                     {
                         byte* src = srcPtr + img.dataOffset;
 
-                        // Copy with RGB->BGR conversion
                         for (int y = 0; y < height; y++)
                         {
                             byte* srcRow = src + y * strideSrc;
@@ -273,7 +284,6 @@ namespace Receiver
                                 int srcIdx = x * 3;
                                 int dstIdx = x * 3;
 
-                                // RGB -> BGR swap
                                 dstRow[dstIdx + 0] = srcRow[srcIdx + 2]; // B = R
                                 dstRow[dstIdx + 1] = srcRow[srcIdx + 1]; // G = G
                                 dstRow[dstIdx + 2] = srcRow[srcIdx + 0]; // R = B
@@ -285,7 +295,6 @@ namespace Receiver
                 {
                     byte* src = (byte*)(img.NativeBytes + img.dataOffset);
 
-                    // Copy with RGB->BGR conversion
                     for (int y = 0; y < height; y++)
                     {
                         byte* srcRow = src + y * strideSrc;
@@ -296,7 +305,6 @@ namespace Receiver
                             int srcIdx = x * 3;
                             int dstIdx = x * 3;
 
-                            // RGB -> BGR swap
                             dstRow[dstIdx + 0] = srcRow[srcIdx + 2]; // B = R
                             dstRow[dstIdx + 1] = srcRow[srcIdx + 1]; // G = G
                             dstRow[dstIdx + 2] = srcRow[srcIdx + 0]; // R = B
@@ -320,20 +328,17 @@ namespace Receiver
                 _isReinitializing = true;
                 LogToFile($"🔄 Reinitializing decoder for new size: {newWidth}x{newHeight}");
 
-                // Dispose old decoder
                 _videoDecoder?.Dispose();
                 _decodedImage?.Dispose();
 
-                // Reset frame count for new stream
                 _receivedFrames = 0;
                 _skippedFrames = 0;
                 _failedDecodes = 0;
+                _performanceMonitor.Reset();
 
-                // Update size
                 _imageWidth = newWidth;
                 _imageHeight = newHeight;
 
-                // Reinitialize decoder
                 _videoDecoder = new H264Decoder();
 
                 var decParam = new TagSVCDecodingParam();
@@ -343,7 +348,6 @@ namespace Receiver
 
                 _videoDecoder.Initialize(decParam);
 
-                // Pre-allocate new image buffer
                 _decodedImage = new RgbImage(ImageFormat.Bgr, _imageWidth, _imageHeight);
 
                 LogToFile($"✅ Decoder reinitialized: {_imageWidth}x{_imageHeight}");
@@ -371,15 +375,13 @@ namespace Receiver
             }
             catch
             {
-                // Ignore logging errors
             }
         }
 
         public void DisposeDecoder()
         {
-            LogToFile("🛑 Decoder disposed");
+            LogToFile($"🛑 Decoder disposed. Final stats: {_performanceMonitor.GetStatusString()}");
 
-            // Dispose the image buffer
             _decodedImage?.Dispose();
             _decodedImage = null;
 
@@ -493,11 +495,6 @@ namespace Receiver
                     Buffer.BlockCopy(packet, HEADER_SIZE, _frameBuffer, _frameBufferPosition, payloadSize);
                     _frameBufferPosition += payloadSize;
                     _receivedChunks++;
-
-                    if (_receivedChunks == 1 || isLastChunk)
-                    {
-                        LogToFile($"  📦 Chunk {_receivedChunks}: received {payloadSize} bytes, isLast={isLastChunk}");
-                    }
 
                     if (isLastChunk)
                     {
