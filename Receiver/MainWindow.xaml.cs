@@ -59,6 +59,12 @@ namespace Receiver
                 _frameReceiver.InitializeReceiver(port, Dispatcher, UpdateStatus);
                 _videoDecoder.InitializeDecoder(Dispatcher, UpdateStatus);
 
+                // ✅ NEW: Wire up dropped frame event for accurate UI metrics
+                _frameReceiver.FrameDroppedForUI += () =>
+                {
+                    _videoDecoder.PerformanceMonitor.RecordDroppedFrame();
+                };
+
                 _frameReceiver.EncodedDataReceived += OnEncodedDataReceived;
                 _videoDecoder.FrameDecoded += OnFrameDecoded;
                 _videoDecoder.MetricsUpdated += OnMetricsUpdated;
@@ -188,6 +194,7 @@ namespace Receiver
             if (_frameReceiver != null)
             {
                 _frameReceiver.EncodedDataReceived -= OnEncodedDataReceived;
+                _frameReceiver.FrameDroppedForUI -= null;  // ✅ NEW: Unsubscribe from dropped frame event
                 _frameReceiver.StopReceiving();
                 _frameReceiver.Dispose();
                 _frameReceiver = null;
@@ -238,6 +245,7 @@ namespace Receiver
             if (_frameReceiver != null)
             {
                 _frameReceiver.EncodedDataReceived -= OnEncodedDataReceived;
+                _frameReceiver.FrameDroppedForUI -= null;  // ✅ NEW: Cleanup on window close too
                 _frameReceiver.Dispose();
             }
 

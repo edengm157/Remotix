@@ -18,7 +18,10 @@ namespace ScreenCaptureApp
         private VideoEncoder _encoder;
         private WriteableBitmap _previewBitmap;
         private InputReceiver _inputReceiver;
+        private IFrameRequestListener _iframeListener; // NEW: I-Frame request listener
         private System.Windows.Threading.DispatcherTimer _metricsUpdateTimer;
+
+        private const int VIDEO_PORT = 12345; // Your video streaming port
 
         public MainWindow()
         {
@@ -136,6 +139,12 @@ namespace ScreenCaptureApp
         {
             try
             {
+                // NEW: Start I-Frame request listener
+                // Listens on VIDEO_PORT + 1 for control messages from receiver
+                _iframeListener = new IFrameRequestListener(VIDEO_PORT);
+                _iframeListener.IFrameRequested += () => _encoder.RequestIFrame();
+                _iframeListener.StartListening();
+
                 await _capturer.StartCaptureAsync(this);
 
                 var sz = _capturer.LastSize;
@@ -165,13 +174,17 @@ namespace ScreenCaptureApp
                 // Start metrics timer
                 _metricsUpdateTimer.Start();
 
-                StatusText.Text = "🎬 Capture started | Monitoring performance...";
+                StatusText.Text = "🎬 Capture started | I-Frame recovery active | Monitoring performance...";
             }
             catch (Exception ex)
             {
                 MessageBox.Show($"Error starting capture:\n{ex.Message}",
                     "Error", MessageBoxButton.OK, MessageBoxImage.Warning);
                 StatusText.Text = "❌ Error starting";
+
+                // Clean up I-Frame listener if startup failed
+                _iframeListener?.Dispose();
+                _iframeListener = null;
             }
         }
 
@@ -179,6 +192,10 @@ namespace ScreenCaptureApp
         {
             // Stop metrics timer
             _metricsUpdateTimer.Stop();
+
+            // NEW: Stop I-Frame listener
+            _iframeListener?.Dispose();
+            _iframeListener = null;
 
             _capturer.StopCapture();
             _encoder.DisposeEncoder();
@@ -241,6 +258,11 @@ namespace ScreenCaptureApp
         private void MainWindow_Closed(object sender, EventArgs e)
         {
             _metricsUpdateTimer?.Stop();
+
+            // NEW: Dispose I-Frame listener
+            _iframeListener?.Dispose();
+            _iframeListener = null;
+
             _capturer.StopCapture();
             _capturer.DisposeAll();
             _encoder.DisposeEncoder();

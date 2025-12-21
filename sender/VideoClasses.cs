@@ -1,14 +1,15 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Net;
+using System.Net.Sockets;
 using System.Runtime.InteropServices;
+using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
 using System.Windows.Threading;
 using SharpDX.Direct3D11;
 using H264Sharp;
-using System.Net;
-using System.Net.Sockets;
-using System.Windows;
-using System.Windows.Interop;
 using Windows.Graphics;
 using Windows.Graphics.Capture;
 using Windows.Graphics.DirectX.Direct3D11;
@@ -29,9 +30,14 @@ namespace sender
 
         private readonly string _logPath = "h264_sent.log";
 
-        private const int MAX_PACKET_SIZE = 1400;
-        private const int HEADER_SIZE = 5;
-        private const int MAX_PAYLOAD_SIZE = MAX_PACKET_SIZE - HEADER_SIZE;
+        private long _sequenceNumber = 0;
+        private long _frameNumber = 0;
+        private const int MAX_UDP_PAYLOAD = 1400;
+
+        // I-Frame request handling
+        private bool _forceNextIFrame = false;
+        private DateTime _lastIFrameRequestTime = DateTime.MinValue;
+        private int _iframeRequestsReceived = 0;
 
         // Performance monitoring and adaptation
         private PerformanceMonitor _performanceMonitor;
@@ -52,7 +58,7 @@ namespace sender
             {
                 File.Delete(_logPath);
             }
-            WriteLog("🚀 VideoEncoder initialized with performance monitoring");
+            WriteLog("🚀 VideoEncoder initialized with I-Frame request handling");
 
             _performanceMonitor = new PerformanceMonitor();
             _qualityController = new AdaptiveQualityController(_performanceMonitor);
@@ -116,6 +122,25 @@ namespace sender
             }
         }
 
+        /// <summary>
+        /// Called by control listener when I-Frame request is received
+        /// </summary>
+        public void RequestIFrame()
+        {
+            // Deduplicate requests (receiver sends 3 times)
+            if ((DateTime.Now - _lastIFrameRequestTime).TotalMilliseconds < 500)
+            {
+                WriteLog("🔄 Duplicate I-Frame request ignored (within 500ms)");
+                return;
+            }
+
+            _lastIFrameRequestTime = DateTime.Now;
+            _iframeRequestsReceived++;
+            _forceNextIFrame = true;
+
+            WriteLog($"📥 I-FRAME REQUEST RECEIVED (#{_iframeRequestsReceived}) - will force IDR on next frame");
+        }
+
         public void EncodeAndSendFrame(Texture2D tex, SharpDX.Direct3D11.Texture2DDescription desc,
             Device mainD3D, UdpClient udpClient, IPEndPoint remoteTarget,
             Dispatcher dispatcher = null, Action<string> statusCallback = null)
@@ -137,6 +162,14 @@ namespace sender
 
             try
             {
+                // Check if we need to force an I-Frame
+                if (_forceNextIFrame)
+                {
+                    WriteLog("🎯 FORCING I-FRAME (IDR) due to request");
+                    _videoEnc.ForceIntraFrame();
+                    _forceNextIFrame = false;
+                }
+
                 var d = tex.Description;
                 d.CpuAccessFlags = SharpDX.Direct3D11.CpuAccessFlags.Read;
                 d.Usage = ResourceUsage.Staging;
@@ -332,30 +365,63 @@ namespace sender
                 return;
             }
 
-            int totalChunks = (int)Math.Ceiling((double)frameData.Length / MAX_PAYLOAD_SIZE);
+            _frameNumber++;
 
-            for (int chunkIndex = 0; chunkIndex < totalChunks; chunkIndex++)
+            // Calculate how many packets we need for this frame
+            // Reserve space for header: "seq#frame#nnn" = roughly 20 bytes max
+            const int MAX_HEADER_SIZE = 30; // Conservative estimate
+            int maxPayloadPerPacket = MAX_UDP_PAYLOAD - MAX_HEADER_SIZE;
+
+            int totalPackets = (int)Math.Ceiling((double)frameData.Length / maxPayloadPerPacket);
+            string totalPacketsStr = totalPackets.ToString("D3"); // 3 digits: 001, 002, etc.
+
+            WriteLog($"📤 Sending frame #{_frameNumber}: {frameData.Length} bytes → {totalPackets} packets");
+
+            int offset = 0;
+            int packetIndex = 1;
+
+            while (offset < frameData.Length)
             {
-                int offset = chunkIndex * MAX_PAYLOAD_SIZE;
-                int payloadSize = Math.Min(MAX_PAYLOAD_SIZE, frameData.Length - offset);
-                bool isLastChunk = (chunkIndex == totalChunks - 1);
+                _sequenceNumber++;
 
-                byte[] packet = new byte[HEADER_SIZE + payloadSize];
+                // Build header: "seq#frame#nnn"
+                string header = $"{_sequenceNumber}#{_frameNumber}#{totalPacketsStr}";
+                byte[] headerBytes = System.Text.Encoding.ASCII.GetBytes(header);
 
-                BitConverter.GetBytes(payloadSize).CopyTo(packet, 0);
-                packet[4] = (byte)(isLastChunk ? 1 : 0);
+                // Calculate how much payload we can fit
+                int availableSpace = MAX_UDP_PAYLOAD - MAX_HEADER_SIZE;
+                int payloadSize = Math.Min(availableSpace, frameData.Length - offset);
 
-                System.Buffer.BlockCopy(frameData, offset, packet, HEADER_SIZE, payloadSize);
+                // Build complete packet: header + payload
+                byte[] packet = new byte[headerBytes.Length + payloadSize];
+
+                // Copy header
+                System.Buffer.BlockCopy(headerBytes, 0, packet, 0, headerBytes.Length);
+
+                // Copy payload
+                System.Buffer.BlockCopy(frameData, offset, packet, headerBytes.Length, payloadSize);
 
                 try
                 {
-                    udpClient.Send(packet, packet.Length, remoteTarget);
+                    int bytesSent = udpClient.Send(packet, packet.Length, remoteTarget);
+
+                    if (packetIndex == 1 || packetIndex == totalPackets)
+                    {
+                        WriteLog($"  ✅ Packet {packetIndex}/{totalPackets}: Seq={_sequenceNumber}, " +
+                                $"Header={headerBytes.Length}B, Payload={payloadSize}B, Total={bytesSent}B");
+                    }
                 }
                 catch (Exception ex)
                 {
-                    WriteLog($"❌ FAILED chunk {chunkIndex + 1}: {ex.Message}");
+                    WriteLog($"  ❌ FAILED packet {packetIndex}/{totalPackets}, Seq={_sequenceNumber}: {ex.Message}");
                 }
+
+                offset += payloadSize;
+                packetIndex++;
             }
+
+            WriteLog($"✅ Frame #{_frameNumber} sent: {totalPackets} packets (Seq {_sequenceNumber - totalPackets + 1} to {_sequenceNumber})");
+            WriteLog("─────────────────────────────────────────");
         }
 
         private void WriteLog(string message)
@@ -372,6 +438,7 @@ namespace sender
         public void DisposeEncoder()
         {
             WriteLog($"🛑 Encoder disposed. Final stats: {_performanceMonitor.GetStatusString()}");
+            WriteLog($"📊 Total I-Frame requests received: {_iframeRequestsReceived}");
             _videoEnc?.Dispose();
             _videoEnc = null;
         }
@@ -382,7 +449,115 @@ namespace sender
         }
     }
 
-internal class FrameCapturer : IDisposable
+    /// <summary>
+    /// Listens for I-Frame requests from the receiver on video port + 1
+    /// </summary>
+    internal class IFrameRequestListener : IDisposable
+    {
+        private UdpClient _controlListener;
+        private CancellationTokenSource _cancellationTokenSource;
+        private Task _listenTask;
+        private int _listenPort;
+        private readonly string _logPath = "iframe_listener.log";
+
+        public event Action IFrameRequested;
+
+        /// <param name="videoPort">The main video streaming port (control will be videoPort + 1)</param>
+        public IFrameRequestListener(int videoPort)
+        {
+            _listenPort = videoPort + 2; // Control port = video port + 2
+
+            if (File.Exists(_logPath))
+            {
+                File.Delete(_logPath);
+            }
+            LogToFile($"🎧 IFrameRequestListener initialized on port {_listenPort} (video port {videoPort} + 1)");
+        }
+
+        public void StartListening()
+        {
+            try
+            {
+                _controlListener = new UdpClient(_listenPort);
+                _cancellationTokenSource = new CancellationTokenSource();
+                _listenTask = Task.Run(() => ListenLoop(_cancellationTokenSource.Token));
+
+                LogToFile($"▶️ Started listening for I-Frame requests on port {_listenPort}");
+            }
+            catch (Exception ex)
+            {
+                LogToFile($"❌ Failed to start listener: {ex.Message}");
+                throw;
+            }
+        }
+
+        private async Task ListenLoop(CancellationToken ct)
+        {
+            LogToFile("🔄 Listen loop started");
+
+            while (!ct.IsCancellationRequested)
+            {
+                try
+                {
+                    var result = await _controlListener.ReceiveAsync();
+                    string message = Encoding.ASCII.GetString(result.Buffer);
+
+                    if (message == "IFRAME_REQUEST")
+                    {
+                        LogToFile($"📥 I-Frame request received from {result.RemoteEndPoint}");
+                        IFrameRequested?.Invoke();
+                    }
+                    else
+                    {
+                        LogToFile($"⚠️ Unknown control message: '{message}' from {result.RemoteEndPoint}");
+                    }
+                }
+                catch (ObjectDisposedException)
+                {
+                    LogToFile("⚠️ Listener disposed, exiting loop");
+                    break;
+                }
+                catch (Exception ex)
+                {
+                    LogToFile($"❌ Listen error: {ex.Message}");
+                }
+            }
+
+            LogToFile("🛑 Listen loop ended");
+        }
+
+        public void StopListening()
+        {
+            LogToFile("🛑 Stopping listener...");
+
+            _cancellationTokenSource?.Cancel();
+            _listenTask?.Wait(TimeSpan.FromSeconds(2));
+        }
+
+        private void LogToFile(string message)
+        {
+            try
+            {
+                File.AppendAllText(_logPath, $"[{DateTime.Now:HH:mm:ss.fff}] {message}\n");
+            }
+            catch
+            {
+            }
+        }
+
+        public void Dispose()
+        {
+            StopListening();
+
+            _controlListener?.Close();
+            _controlListener?.Dispose();
+            _controlListener = null;
+
+            LogToFile("🗑️ IFrameRequestListener disposed");
+        }
+    }
+
+    internal class FrameCapturer : IDisposable
     {
         public Device MainDevice => _mainD3D;
         public UdpClient UdpClient => _udpClient;
@@ -416,10 +591,10 @@ internal class FrameCapturer : IDisposable
             _winRTDevice = Direct3D11Helper.CreateDevice(_mainD3D);
         }
 
-        public async System.Threading.Tasks.Task StartCaptureAsync(Window win)
+        public async System.Threading.Tasks.Task StartCaptureAsync(System.Windows.Window win)
         {
             var picker = new GraphicsCapturePicker();
-            var hwnd = new WindowInteropHelper(win).Handle;
+            var hwnd = new System.Windows.Interop.WindowInteropHelper(win).Handle;
 
             WinRT.Interop.InitializeWithWindow.Initialize(picker, hwnd);
 
