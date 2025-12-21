@@ -10,6 +10,9 @@ using System.Windows;
 using System.Windows.Media;
 using System.Windows.Media.Imaging;
 using System.Windows.Threading;
+using System.Text;
+using System.Linq;
+using System.Collections.Generic;
 
 namespace Receiver
 {
@@ -67,7 +70,7 @@ namespace Receiver
 
                 LogToFile($"✅ H264Sharp decoder initialized with AVC parameters, buffer: {_imageWidth}x{_imageHeight}");
 
-                dispatcher?.Invoke(() =>
+                dispatcher?.BeginInvoke(() =>
                 {
                     statusCallback?.Invoke("Decoder initialized and ready");
                 });
@@ -75,7 +78,7 @@ namespace Receiver
             catch (Exception initErr)
             {
                 LogToFile($"❌ Decoder init error: {initErr.Message}");
-                dispatcher?.Invoke(() =>
+                dispatcher?.BeginInvoke(() =>
                 {
                     statusCallback?.Invoke($"Decoder init error: {initErr.Message}");
                 });
@@ -99,6 +102,26 @@ namespace Receiver
                 return;
             }
 
+            // Copy data to prevent race conditions
+            byte[] dataCopy = new byte[encodedData.Length];
+            Buffer.BlockCopy(encodedData, 0, dataCopy, 0, encodedData.Length);
+
+            // Use BeginInvoke to avoid blocking UDP thread
+            if (dispatcher != null)
+            {
+                dispatcher.BeginInvoke(new Action(() =>
+                {
+                    DecodeInternal(dataCopy, statusCallback);
+                }));
+            }
+            else
+            {
+                DecodeInternal(dataCopy, statusCallback);
+            }
+        }
+
+        private void DecodeInternal(byte[] encodedData, Action<string> statusCallback)
+        {
             long frameStartTime = _frameTimer.ElapsedMilliseconds;
 
             try
@@ -134,10 +157,7 @@ namespace Receiver
 
                     if (_skippedFrames % 10 == 0)
                     {
-                        dispatcher?.Invoke(() =>
-                        {
-                            statusCallback?.Invoke($"⏳ Waiting for keyframe... skipped {_skippedFrames} frames");
-                        });
+                        statusCallback?.Invoke($"⏳ Waiting for keyframe... skipped {_skippedFrames} frames");
                     }
                     return;
                 }
@@ -186,35 +206,33 @@ namespace Receiver
 
                     LogToFile($"✅ Successfully decoded frame #{_receivedFrames}: {_decodedImage.Width}x{_decodedImage.Height}");
 
-                    dispatcher?.Invoke(() =>
+                    // Already on UI thread - no dispatcher needed
+                    try
                     {
-                        try
+                        var bitmapSource = RgbImageToWriteableBitmap(_decodedImage);
+                        LogToFile($"✅ Converted to WriteableBitmap: {bitmapSource.PixelWidth}x{bitmapSource.PixelHeight}");
+
+                        FrameDecoded?.Invoke(bitmapSource);
+                        LogToFile("✅ FrameDecoded event invoked");
+
+                        // Update status with metrics
+                        if (_receivedFrames % 15 == 0)
                         {
-                            var bitmapSource = RgbImageToWriteableBitmap(_decodedImage);
-                            LogToFile($"✅ Converted to WriteableBitmap: {bitmapSource.PixelWidth}x{bitmapSource.PixelHeight}");
+                            string status = $"{_performanceMonitor.GetQualityIndicator()} {_performanceMonitor.GetStatusString()}";
+                            statusCallback?.Invoke(status);
 
-                            FrameDecoded?.Invoke(bitmapSource);
-                            LogToFile("✅ FrameDecoded event invoked");
-
-                            // Update status with metrics
-                            if (_receivedFrames % 15 == 0)
-                            {
-                                string status = $"{_performanceMonitor.GetQualityIndicator()} {_performanceMonitor.GetStatusString()}";
-                                statusCallback?.Invoke(status);
-
-                                MetricsUpdated?.Invoke(_performanceMonitor);
-                            }
-                            else if (_receivedFrames == 1)
-                            {
-                                statusCallback?.Invoke($"✅ First frame decoded! {_decodedImage.Width}x{_decodedImage.Height}");
-                            }
+                            MetricsUpdated?.Invoke(_performanceMonitor);
                         }
-                        catch (Exception convErr)
+                        else if (_receivedFrames == 1)
                         {
-                            LogToFile($"❌ Display error: {convErr.Message}\n{convErr.StackTrace}");
-                            statusCallback?.Invoke($"Display error: {convErr.Message}");
+                            statusCallback?.Invoke($"✅ First frame decoded! {_decodedImage.Width}x{_decodedImage.Height}");
                         }
-                    });
+                    }
+                    catch (Exception convErr)
+                    {
+                        LogToFile($"❌ Display error: {convErr.Message}\n{convErr.StackTrace}");
+                        statusCallback?.Invoke($"Display error: {convErr.Message}");
+                    }
                 }
                 else
                 {
@@ -227,10 +245,7 @@ namespace Receiver
                         string firstBytes = BitConverter.ToString(encodedData, 0, Math.Min(50, encodedData.Length));
                         LogToFile($"First 50 bytes: {firstBytes}");
 
-                        dispatcher?.Invoke(() =>
-                        {
-                            statusCallback?.Invoke($"Decode failed #{_failedDecodes}: state={ds}, size={encodedData.Length}");
-                        });
+                        statusCallback?.Invoke($"Decode failed #{_failedDecodes}: state={ds}, size={encodedData.Length}");
                     }
                 }
             }
@@ -238,10 +253,7 @@ namespace Receiver
             {
                 LogToFile($"❌ Decoder exception: {decErr.Message}\n{decErr.StackTrace}");
                 _performanceMonitor.RecordDroppedFrame();
-                dispatcher?.Invoke(() =>
-                {
-                    statusCallback?.Invoke($"Decoder error: {decErr.Message}");
-                });
+                statusCallback?.Invoke($"Decoder error: {decErr.Message}");
             }
         }
 
@@ -354,7 +366,7 @@ namespace Receiver
 
                 _isReinitializing = false;
 
-                dispatcher?.Invoke(() =>
+                dispatcher?.BeginInvoke(() =>
                 {
                     statusCallback?.Invoke($"Decoder reinitialized for {_imageWidth}x{_imageHeight}");
                 });
@@ -398,21 +410,35 @@ namespace Receiver
     internal class FrameReceiver : IDisposable
     {
         private UdpClient _udpClient;
+        private UdpClient _controlClient;
         private CancellationTokenSource _cancellationTokenSource;
         private Task _receiveTask;
         private int _port;
+        private IPEndPoint _senderEndPoint;
+        private const int CONTROL_PORT_OFFSET = 2;
 
-        private byte[] _frameBuffer = new byte[10 * 1024 * 1024];
-        private int _frameBufferPosition = 0;
-        private int _receivedChunks = 0;
+        // Frame reassembly state
+        private Dictionary<long, FrameAssembler> _incompleteFrames = new Dictionary<long, FrameAssembler>();
+        private long _lastDeliveredFrame = -1;
+        private long _lastSeenSequence = 0;
+
+        // I-Frame request state
+        private bool _waitingForIFrame = false;
+        private DateTime _lastIFrameRequestTime = DateTime.MinValue;
+        private const int IFRAME_REQUEST_COOLDOWN_MS = 1000;
+
+        // Statistics
         private int _totalFramesReceived = 0;
+        private long _totalPacketsReceived = 0;
+        private long _duplicatePackets = 0;
+        private long _outOfOrderPackets = 0;
+        private long _lostPackets = 0;
+        private int _iframeRequestsSent = 0;
 
         public event Action<byte[]> EncodedDataReceived;
+        public event Action FrameDroppedForUI;
 
         private readonly string _logPath = "receiver_udp.log";
-
-        private const int MAX_PACKET_SIZE = 1400;
-        private const int HEADER_SIZE = 5;
 
         public FrameReceiver()
         {
@@ -420,7 +446,7 @@ namespace Receiver
             {
                 File.Delete(_logPath);
             }
-            LogToFile("🚀 FrameReceiver initialized");
+            LogToFile("🚀 FrameReceiver initialized with I-Frame request capability");
         }
 
         public void InitializeReceiver(int port, Dispatcher dispatcher = null, Action<string> statusCallback = null)
@@ -429,11 +455,15 @@ namespace Receiver
             {
                 _port = port;
                 _udpClient = new UdpClient(_port);
-                _udpClient.Client.ReceiveBufferSize = 1024 * 1024;
+                _udpClient.Client.ReceiveBufferSize = 2 * 1024 * 1024;
+
+                _controlClient = new UdpClient();
 
                 LogToFile($"✅ UDP socket created on port {_port}");
+                LogToFile($"✅ Control client created for I-Frame requests");
+                LogToFile($"📋 Will send control messages to sender's port + {CONTROL_PORT_OFFSET}");
 
-                dispatcher?.Invoke(() =>
+                dispatcher?.BeginInvoke(() =>
                 {
                     statusCallback?.Invoke($"Receiver ready on port {_port}");
                 });
@@ -455,12 +485,17 @@ namespace Receiver
             _cancellationTokenSource = new CancellationTokenSource();
             _receiveTask = Task.Run(() => ReceiveLoop(_cancellationTokenSource.Token));
 
-            LogToFile("▶️ Started receiving loop");
+            LogToFile("▶️ Started receiving loop with I-Frame request on packet loss");
         }
 
         private async Task ReceiveLoop(CancellationToken ct)
         {
             LogToFile($"🔄 Receive loop started on port {_port}");
+
+            // TEMP, DELETE LATER
+            Random random = new Random();
+            int droppedPackets = 0;
+            int totalPacketsForRandom = 0;
 
             while (!ct.IsCancellationRequested)
             {
@@ -469,49 +504,110 @@ namespace Receiver
                     var result = await _udpClient.ReceiveAsync();
                     byte[] packet = result.Buffer;
 
-                    if (packet.Length < HEADER_SIZE)
+                    if (_senderEndPoint == null)
                     {
-                        LogToFile($"⚠️ Packet too small: {packet.Length} bytes");
+                        _senderEndPoint = result.RemoteEndPoint;
+                        LogToFile($"📍 Sender identified: {_senderEndPoint.Address}:{_senderEndPoint.Port}");
+                    }
+
+                    _totalPacketsReceived++;
+                    totalPacketsForRandom++;
+
+                    //TEMP DELETE LATER
+                    // 🎲 SIMULATE 0.5% PACKET LOSS (1 in 200 packets)
+                    if (random.Next(200) == 0)
+                    {
+                        droppedPackets++;
+                        LogToFile($"🎲 SIMULATED PACKET LOSS! Dropped packet #{totalPacketsForRandom} (Total dropped: {droppedPackets}/{totalPacketsForRandom} = {(droppedPackets * 100.0 / totalPacketsForRandom):F2}%)");
                         continue;
                     }
 
-                    int payloadSize = BitConverter.ToInt32(packet, 0);
-                    bool isLastChunk = packet[4] == 1;
-
-                    if (payloadSize < 0 || payloadSize > MAX_PACKET_SIZE - HEADER_SIZE)
+                    if (!ParsePacketHeader(packet, out long seqNum, out long frameNum, out int totalPackets, out byte[] payload))
                     {
-                        LogToFile($"❌ Invalid payload size: {payloadSize}");
+                        LogToFile($"❌ Failed to parse packet header");
                         continue;
                     }
 
-                    if (_frameBufferPosition + payloadSize > _frameBuffer.Length)
+                    // Detect out-of-order packets
+                    if (seqNum <= _lastSeenSequence && _lastSeenSequence > 0)
                     {
-                        LogToFile($"❌ Frame buffer overflow! Resetting.");
-                        _frameBufferPosition = 0;
-                        _receivedChunks = 0;
-                        continue;
+                        _outOfOrderPackets++;
+                        if (_outOfOrderPackets % 10 == 1)
+                        {
+                            LogToFile($"📊 Out-of-order: Seq {seqNum} (expected > {_lastSeenSequence})");
+                        }
                     }
 
-                    Buffer.BlockCopy(packet, HEADER_SIZE, _frameBuffer, _frameBufferPosition, payloadSize);
-                    _frameBufferPosition += payloadSize;
-                    _receivedChunks++;
-
-                    if (isLastChunk)
+                    // Simple packet loss detection - immediate I-Frame request
+                    if (seqNum > _lastSeenSequence + 1 && _lastSeenSequence > 0)
                     {
-                        _totalFramesReceived++;
+                        long gap = seqNum - _lastSeenSequence - 1;
+                        _lostPackets += gap;
 
-                        LogToFile($"✅ Complete frame received: {_receivedChunks} chunks, {_frameBufferPosition} total bytes");
+                        LogToFile($"⚠️ PACKET LOSS! Gap: {gap} packets (Seq {_lastSeenSequence + 1} to {seqNum - 1})");
 
-                        byte[] frameData = new byte[_frameBufferPosition];
-                        Buffer.BlockCopy(_frameBuffer, 0, frameData, 0, _frameBufferPosition);
+                        await RequestIFrameAsync();
+                    }
 
-                        EncodedDataReceived?.Invoke(frameData);
+                    _lastSeenSequence = Math.Max(_lastSeenSequence, seqNum);
 
-                        LogToFile($"📤 Frame #{_totalFramesReceived} sent to decoder");
-                        LogToFile("────────────────────────────────────────");
+                    // Get or create frame assembler
+                    if (!_incompleteFrames.ContainsKey(frameNum))
+                    {
+                        _incompleteFrames[frameNum] = new FrameAssembler(frameNum, totalPackets);
+                        LogToFile($"📦 New frame #{frameNum} started (expects {totalPackets} packets)");
+                    }
 
-                        _frameBufferPosition = 0;
-                        _receivedChunks = 0;
+                    FrameAssembler assembler = _incompleteFrames[frameNum];
+
+                    bool isNewPacket = assembler.AddPacket(seqNum, payload);
+
+                    if (!isNewPacket)
+                    {
+                        _duplicatePackets++;
+                        if (_duplicatePackets % 10 == 1)
+                        {
+                            LogToFile($"🔄 Duplicate packet: Frame {frameNum}, Seq {seqNum}");
+                        }
+                    }
+
+                    if (assembler.IsComplete)
+                    {
+                        byte[] completeFrame = assembler.GetCompleteFrame();
+
+                        LogToFile($"✅ Frame #{frameNum} COMPLETE: {assembler.ReceivedPackets}/{assembler.TotalPackets} packets, {completeFrame.Length} bytes");
+
+                        if (_waitingForIFrame)
+                        {
+                            bool isCompleteIFrame = IsIFrame(completeFrame);
+
+                            if (isCompleteIFrame)
+                            {
+                                LogToFile($"🎯 COMPLETE I-FRAME RECEIVED! Frame #{frameNum} - resuming normal operation");
+                                _waitingForIFrame = false;
+
+                                _incompleteFrames.Clear();
+
+                                DeliverFrame(frameNum, completeFrame);
+                            }
+                            else
+                            {
+                                LogToFile($"⏸️ Frame #{frameNum} complete but NOT an I-Frame (missing SPS/PPS/IDR), discarding");
+                                _incompleteFrames.Remove(frameNum);
+                            }
+                        }
+                        else
+                        {
+                            DeliverFrame(frameNum, completeFrame);
+                            CleanupOldFrames(frameNum);
+                        }
+                    }
+                    else
+                    {
+                        if (_totalPacketsReceived % 50 == 0)
+                        {
+                            LogToFile($"📥 Frame #{frameNum}: {assembler.ReceivedPackets}/{assembler.TotalPackets} packets");
+                        }
                     }
                 }
                 catch (ObjectDisposedException)
@@ -525,7 +621,183 @@ namespace Receiver
                 }
             }
 
-            LogToFile("🛑 Receive loop ended");
+            LogToFile($"🛑 Receive loop ended");
+            LogStatistics();
+        }
+
+        private bool ParsePacketHeader(byte[] packet, out long seqNum, out long frameNum, out int totalPackets, out byte[] payload)
+        {
+            seqNum = 0;
+            frameNum = 0;
+            totalPackets = 0;
+            payload = null;
+
+            try
+            {
+                int firstHash = Array.IndexOf(packet, (byte)'#');
+                if (firstHash < 0 || firstHash > 20)
+                {
+                    return false;
+                }
+
+                int secondHash = Array.IndexOf(packet, (byte)'#', firstHash + 1);
+                if (secondHash < 0 || secondHash > firstHash + 20)
+                {
+                    return false;
+                }
+
+                string seqStr = Encoding.ASCII.GetString(packet, 0, firstHash);
+                string frameStr = Encoding.ASCII.GetString(packet, firstHash + 1, secondHash - firstHash - 1);
+                string totalStr = Encoding.ASCII.GetString(packet, secondHash + 1, 3);
+
+                if (!long.TryParse(seqStr, out seqNum))
+                {
+                    return false;
+                }
+
+                if (!long.TryParse(frameStr, out frameNum))
+                {
+                    return false;
+                }
+
+                if (!int.TryParse(totalStr, out totalPackets))
+                {
+                    return false;
+                }
+
+                int payloadStart = secondHash + 1 + 3;
+                int payloadSize = packet.Length - payloadStart;
+
+                if (payloadSize < 0)
+                {
+                    return false;
+                }
+
+                payload = new byte[payloadSize];
+                Buffer.BlockCopy(packet, payloadStart, payload, 0, payloadSize);
+
+                return true;
+            }
+            catch (Exception ex)
+            {
+                LogToFile($"❌ Parse error: {ex.Message}");
+                return false;
+            }
+        }
+
+        private bool IsIFrame(byte[] data)
+        {
+            bool hasSPS = false;
+            bool hasPPS = false;
+            bool hasIDR = false;
+
+            for (int i = 0; i < data.Length - 4; i++)
+            {
+                if (data[i] == 0x00 && data[i + 1] == 0x00 &&
+                    data[i + 2] == 0x00 && data[i + 3] == 0x01)
+                {
+                    if (i + 4 < data.Length)
+                    {
+                        int nalType = data[i + 4] & 0x1F;
+
+                        if (nalType == 7) hasSPS = true;
+                        if (nalType == 8) hasPPS = true;
+                        if (nalType == 5) hasIDR = true;
+                    }
+                }
+            }
+
+            return hasSPS && hasPPS && hasIDR;
+        }
+
+        private async Task RequestIFrameAsync()
+        {
+            if (_senderEndPoint == null)
+            {
+                LogToFile("⚠️ Cannot request I-Frame: sender endpoint unknown");
+                return;
+            }
+
+            if ((DateTime.Now - _lastIFrameRequestTime).TotalMilliseconds < IFRAME_REQUEST_COOLDOWN_MS)
+            {
+                LogToFile("⏸️ I-Frame request on cooldown, skipping");
+                return;
+            }
+
+            _lastIFrameRequestTime = DateTime.Now;
+            _waitingForIFrame = true;
+
+            int controlPort = _senderEndPoint.Port + CONTROL_PORT_OFFSET;
+            var controlEndpoint = new IPEndPoint(_senderEndPoint.Address, controlPort);
+
+            LogToFile($"📡 Sending I-Frame request to {controlEndpoint.Address}:{controlEndpoint.Port}");
+
+            byte[] requestMessage = Encoding.ASCII.GetBytes("IFRAME_REQUEST");
+
+            for (int i = 0; i < 3; i++)
+            {
+                try
+                {
+                    await _controlClient.SendAsync(requestMessage, requestMessage.Length, controlEndpoint);
+                    _iframeRequestsSent++;
+                    LogToFile($"📤 I-Frame request sent (attempt {i + 1}/3)");
+
+                    if (i < 2)
+                    {
+                        await Task.Delay(50);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    LogToFile($"❌ Failed to send I-Frame request: {ex.Message}");
+                }
+            }
+
+            LogToFile($"✅ I-Frame request sequence complete ({_iframeRequestsSent} total requests sent)");
+        }
+
+        private void DeliverFrame(long frameNum, byte[] frameData)
+        {
+            _totalFramesReceived++;
+            _lastDeliveredFrame = frameNum;
+
+            EncodedDataReceived?.Invoke(frameData);
+
+            LogToFile($"📤 Frame #{frameNum} delivered to decoder ({_totalFramesReceived} total)");
+            LogToFile("────────────────────────────────────────");
+        }
+
+        private void CleanupOldFrames(long currentFrame)
+        {
+            var toRemove = _incompleteFrames.Keys.Where(f => f < currentFrame - 5).ToList();
+
+            foreach (var frameNum in toRemove)
+            {
+                var assembler = _incompleteFrames[frameNum];
+                if (!assembler.IsComplete)
+                {
+                    LogToFile($"🗑️ Discarding incomplete frame #{frameNum} ({assembler.ReceivedPackets}/{assembler.TotalPackets} packets)");
+                    FrameDroppedForUI?.Invoke();
+                }
+                _incompleteFrames.Remove(frameNum);
+            }
+        }
+
+        private void LogStatistics()
+        {
+            double lossPercent = _totalPacketsReceived > 0 ? (_lostPackets * 100.0 / _totalPacketsReceived) : 0;
+
+            LogToFile("═══════════════════════════════════════");
+            LogToFile("📊 FINAL STATISTICS:");
+            LogToFile($"  Total Packets Received: {_totalPacketsReceived}");
+            LogToFile($"  Lost Packets: {_lostPackets} ({lossPercent:F2}%)");
+            LogToFile($"  Out-of-Order Packets: {_outOfOrderPackets}");
+            LogToFile($"  Duplicate Packets: {_duplicatePackets}");
+            LogToFile($"  Total Frames Delivered: {_totalFramesReceived}");
+            LogToFile($"  I-Frame Requests Sent: {_iframeRequestsSent}");
+            LogToFile($"  Last Frame Number: {_lastDeliveredFrame}");
+            LogToFile($"  Last Sequence Number: {_lastSeenSequence}");
+            LogToFile("═══════════════════════════════════════");
         }
 
         public void StopReceiving()
@@ -535,7 +807,7 @@ namespace Receiver
             _cancellationTokenSource?.Cancel();
             _receiveTask?.Wait(TimeSpan.FromSeconds(2));
 
-            LogToFile($"✅ Receiver stopped. Total frames received: {_totalFramesReceived}");
+            LogStatistics();
         }
 
         private void LogToFile(string message)
@@ -557,7 +829,73 @@ namespace Receiver
             _udpClient?.Dispose();
             _udpClient = null;
 
+            _controlClient?.Close();
+            _controlClient?.Dispose();
+            _controlClient = null;
+
             LogToFile("🗑️ FrameReceiver disposed");
+        }
+    }
+
+    /// <summary>
+    /// Assembles packets belonging to a single frame
+    /// </summary>
+    internal class FrameAssembler
+    {
+        public long FrameNumber { get; }
+        public int TotalPackets { get; }
+        public int ReceivedPackets => _packets.Count;
+        public bool IsComplete => ReceivedPackets == TotalPackets;
+
+        private Dictionary<long, byte[]> _packets = new Dictionary<long, byte[]>();
+
+        public FrameAssembler(long frameNumber, int totalPackets)
+        {
+            FrameNumber = frameNumber;
+            TotalPackets = totalPackets;
+        }
+
+        /// <summary>
+        /// Add a packet to this frame. Returns true if packet was new, false if duplicate.
+        /// </summary>
+        public bool AddPacket(long seqNum, byte[] payload)
+        {
+            if (_packets.ContainsKey(seqNum))
+            {
+                return false; // Duplicate
+            }
+
+            _packets[seqNum] = payload;
+            return true;
+        }
+
+        /// <summary>
+        /// Get the complete frame data by concatenating all packets in sequence order
+        /// </summary>
+        public byte[] GetCompleteFrame()
+        {
+            if (!IsComplete)
+            {
+                throw new InvalidOperationException("Frame is not complete yet");
+            }
+
+            // Sort packets by sequence number
+            var orderedPackets = _packets.OrderBy(kvp => kvp.Key).Select(kvp => kvp.Value).ToList();
+
+            // Calculate total size
+            int totalSize = orderedPackets.Sum(p => p.Length);
+
+            // Concatenate all packets
+            byte[] result = new byte[totalSize];
+            int offset = 0;
+
+            foreach (var packet in orderedPackets)
+            {
+                Buffer.BlockCopy(packet, 0, result, offset, packet.Length);
+                offset += packet.Length;
+            }
+
+            return result;
         }
     }
 }
