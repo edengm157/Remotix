@@ -1,20 +1,23 @@
-﻿using System;
+﻿using H264Sharp;
+using SharpDX.Direct3D11;
+using System;
 using System.Collections.Generic;
 using System.IO;
-using System.Runtime.InteropServices;
-using System.Windows.Threading;
-using SharpDX.Direct3D11;
-using H264Sharp;
 using System.Net;
 using System.Net.Sockets;
+using System.Runtime.InteropServices;
+using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
 using System.Windows;
-using System.Windows.Interop;
+using System.Windows.Media.Media3D;
+using System.Windows.Threading;
 using Windows.Graphics;
 using Windows.Graphics.Capture;
 using Windows.Graphics.DirectX.Direct3D11;
-using MapFlags = SharpDX.Direct3D11.MapFlags;
-using Device = SharpDX.Direct3D11.Device;
 using WinRT;
+using Device = SharpDX.Direct3D11.Device;
+using MapFlags = SharpDX.Direct3D11.MapFlags;
 
 namespace sender
 {
@@ -22,26 +25,58 @@ namespace sender
     {
         private H264Encoder _videoEnc;
         private byte[] _scratchFrame;
-        private byte[] _bgrFrame;  // For converted BGR data
+        private byte[] _bgrFrame;
 
         private long _totalBytes = 0;
         private int _sentFrames = 0;
 
         private readonly string _logPath = "h264_sent.log";
 
-        private const int MAX_PACKET_SIZE = 1400;
-        private const int HEADER_SIZE = 5;
-        private const int MAX_PAYLOAD_SIZE = MAX_PACKET_SIZE - HEADER_SIZE;
+        private PixelChangeDetector _pixelDetector = new PixelChangeDetector();
+        private PerformanceMonitor _monitor;
+
+        private long _sequenceNumber = 0;
+        private long _frameNumber = 0;
+        private const int MAX_UDP_PAYLOAD = 1400;
+
+        // I-Frame request handling
+        private bool _forceNextIFrame = false;
+        private DateTime _lastIFrameRequestTime = DateTime.MinValue;
+        private int _iframeRequestsReceived = 0;
+
+        // Performance monitoring and adaptation
+        private PerformanceMonitor _performanceMonitor;
+        private AdaptiveQualityController _qualityController;
+        private bool _adaptiveQualityEnabled = true;
+        private System.Diagnostics.Stopwatch _frameTimer = new System.Diagnostics.Stopwatch();
+
+        private MotionLevel _lastMotionLevel = MotionLevel.Unknown;
+        private int _motionStableFrames = 0;
+        private const int MOTION_CHANGE_THRESHOLD = 3; // צריך 3 פריימים עקביים לשינוי
 
         public event Action<byte[], int, int> FrameDataReady;
+        public event Action<PerformanceMonitor> MetricsUpdated;
+
+        // Expose monitoring
+        public PerformanceMonitor PerformanceMonitor => _performanceMonitor;
+        public AdaptiveQualityController QualityController => _qualityController;
 
         public VideoEncoder()
         {
+
             if (File.Exists(_logPath))
             {
                 File.Delete(_logPath);
             }
-            WriteLog("🚀 VideoEncoder initialized - log started");
+            WriteLog("🚀 VideoEncoder initialized with I-Frame request handling");
+
+            _performanceMonitor = new PerformanceMonitor();
+            _qualityController = new AdaptiveQualityController(_performanceMonitor);
+
+            // Subscribe to quality changes
+            _qualityController.QualityAdjusted += OnQualityAdjusted;
+
+            _frameTimer.Start();
         }
 
         public void InitializeEncoder(int w, int h, Dispatcher dispatcher = null, Action<string> statusCallback = null)
@@ -57,8 +92,9 @@ namespace sender
                 encParams.iPicWidth = w;
                 encParams.iPicHeight = h;
 
-                encParams.iTargetBitrate = 5000000;
-                encParams.fMaxFrameRate = 15;
+                // Use adaptive quality controller's target bitrate and FPS
+                encParams.iTargetBitrate = _qualityController.TargetBitrate;
+                encParams.fMaxFrameRate = _qualityController.TargetFPS;
 
                 encParams.iUsageType = EUsageType.SCREEN_CONTENT_REAL_TIME;
                 encParams.iRCMode = RC_MODES.RC_BITRATE_MODE;
@@ -69,23 +105,24 @@ namespace sender
 
                 encParams.sSpatialLayers[0].iVideoWidth = w;
                 encParams.sSpatialLayers[0].iVideoHeight = h;
-                encParams.sSpatialLayers[0].fFrameRate = 15;
-                encParams.sSpatialLayers[0].iSpatialBitrate = 5000000;
+                encParams.sSpatialLayers[0].fFrameRate = _qualityController.TargetFPS;
+                encParams.sSpatialLayers[0].iSpatialBitrate = _qualityController.TargetBitrate;
 
                 encParams.bEnableFrameSkip = false;
                 encParams.uiIntraPeriod = 30;
 
                 _videoEnc.Initialize(encParams);
 
-                int rawSize = w * h * 4;  // BGRA
+                int rawSize = w * h * 4;
                 _scratchFrame = new byte[rawSize];
-                _bgrFrame = new byte[w * h * 3];  // BGR (no alpha)
+                _bgrFrame = new byte[w * h * 3];
 
-                WriteLog($"✅ Encoder ready: {w}x{h}@15fps, BGR encoding");
+                WriteLog($"✅ Encoder ready: {w}x{h}@{_qualityController.TargetFPS:F0}fps, " +
+                        $"{_qualityController.TargetBitrate / 1000000.0:F1}Mbps, BGR encoding");
 
                 dispatcher?.Invoke(() =>
                 {
-                    statusCallback?.Invoke($"Encoder ready {w}x{h}@15fps");
+                    statusCallback?.Invoke($"Encoder: {w}x{h} | {_qualityController.GetSettingsDescription()}");
                 });
             }
             catch (Exception initErr)
@@ -95,12 +132,183 @@ namespace sender
             }
         }
 
-        public void EncodeAndSendFrame(Texture2D tex, SharpDX.Direct3D11.Texture2DDescription desc, Device mainD3D, UdpClient udpClient, IPEndPoint remoteTarget, Dispatcher dispatcher = null, Action<string> statusCallback = null)
+        /// <summary>
+        /// Called by control listener when I-Frame request is received
+        /// </summary>
+        public void RequestIFrame()
+        {
+            // Deduplicate requests (receiver sends 3 times)
+            if ((DateTime.Now - _lastIFrameRequestTime).TotalMilliseconds < 500)
+            {
+                WriteLog("🔄 Duplicate I-Frame request ignored (within 500ms)");
+                return;
+            }
+
+            _lastIFrameRequestTime = DateTime.Now;
+            _iframeRequestsReceived++;
+            _forceNextIFrame = true;
+
+            WriteLog($"📥 I-FRAME REQUEST RECEIVED (#{_iframeRequestsReceived}) - will force IDR on next frame");
+        }
+
+        //public void EncodeAndSendFrame(Texture2D tex, SharpDX.Direct3D11.Texture2DDescription desc,
+        //    Device mainD3D, UdpClient udpClient, IPEndPoint remoteTarget,
+        //    Dispatcher dispatcher = null, Action<string> statusCallback = null)
+        //{
+        //    if (_videoEnc == null) return;
+
+        //    int expectedRawSize = desc.Width * desc.Height * 4;
+        //    int expectedBgrSize = desc.Width * desc.Height * 3;
+
+        //    if (_scratchFrame == null || _bgrFrame == null ||
+        //        _scratchFrame.Length != expectedRawSize || _bgrFrame.Length != expectedBgrSize)
+        //    {
+        //        WriteLog($"⚠️ Size mismatch! Frame: {desc.Width}x{desc.Height}, Buffer: {_scratchFrame?.Length ?? 0} bytes. Skipping frame.");
+        //        _performanceMonitor.RecordDroppedFrame();
+        //        return;
+        //    }
+
+        //    long frameStartTime = _frameTimer.ElapsedMilliseconds;
+
+        //    try
+        //    {
+        //        // Check if we need to force an I-Frame
+        //        if (_forceNextIFrame)
+        //        {
+        //            WriteLog("🎯 FORCING I-FRAME (IDR) due to request");
+        //            _videoEnc.ForceIntraFrame();
+        //            _forceNextIFrame = false;
+        //        }
+
+        //        var d = tex.Description;
+        //        d.CpuAccessFlags = SharpDX.Direct3D11.CpuAccessFlags.Read;
+        //        d.Usage = ResourceUsage.Staging;
+        //        d.OptionFlags = ResourceOptionFlags.None;
+        //        d.BindFlags = BindFlags.None;
+
+        //        using var stage = new Texture2D(mainD3D, d);
+        //        mainD3D.ImmediateContext.CopyResource(tex, stage);
+
+        //        var mapped = mainD3D.ImmediateContext.MapSubresource(stage, 0, SharpDX.Direct3D11.MapMode.Read, MapFlags.None);
+
+        //        try
+        //        {
+        //            unsafe
+        //            {
+        //                var p = (byte*)mapped.DataPointer;
+        //                int strideBytes = d.Width * 4;
+        //                for (int y = 0; y < d.Height; y++)
+        //                {
+        //                    Marshal.Copy((IntPtr)(p + y * mapped.RowPitch),
+        //                                 _scratchFrame,
+        //                                 y * strideBytes,
+        //                                 strideBytes);
+        //                }
+        //            }
+
+        //            // ✅ ניתוח שינוי פיקסלים - לפני ההמרה
+        //            double changePercent = _pixelDetector.AnalyzeFrame(_scratchFrame, d.Width, d.Height);
+        //            _performanceMonitor.CurrentMotionLevel = _pixelDetector.CurrentMotionLevel;
+        //            WriteLog($"📊 Motion detected: {_pixelDetector.GetMotionDescription()}");
+
+        //            // ✅ המרת BGRA ל-BGR - רק פעם אחת!
+        //            ConvertBgraToBgr(_scratchFrame, _bgrFrame, d.Width, d.Height);
+
+        //            FrameDataReady?.Invoke(_scratchFrame, d.Width, d.Height);
+
+        //            using (var bgr = new RgbImage(ImageFormat.Bgr, d.Width, d.Height, _bgrFrame))
+        //            {
+        //                if (_videoEnc.Encode(bgr, out var outFrames))
+        //                {
+        //                    byte[] encodedBytes = outFrames.GetAllBytes();
+
+        //                    if (encodedBytes != null && encodedBytes.Length > 0)
+        //                    {
+        //                        long encodeTime = _frameTimer.ElapsedMilliseconds - frameStartTime;
+
+        //                        AnalyzeEncodedFrame(encodedBytes, outFrames.Length);
+        //                        SendFrameInChunks(encodedBytes, udpClient, remoteTarget);
+
+        //                        _sentFrames++;
+        //                        _totalBytes += encodedBytes.Length;
+
+        //                        // Record frame metrics
+        //                        _performanceMonitor.RecordFrame(encodedBytes.Length, encodeTime);
+
+        //                        // Check if quality adjustment is needed
+        //                        if (_adaptiveQualityEnabled && _qualityController.UpdateQuality())
+        //                        {
+        //                            WriteLog($"🔧 Quality adjusted: {_qualityController.GetSettingsDescription()}");
+
+        //                            // Re-initialize encoder with new settings
+        //                            ReinitializeWithNewQuality(d.Width, d.Height, dispatcher, statusCallback);
+        //                        }
+
+        //                        // Update UI with metrics
+        //                        if (_sentFrames % 15 == 0 || _sentFrames <= 3)
+        //                        {
+        //                            dispatcher?.Invoke(() =>
+        //                            {
+        //                                string status = $"Frame #{_sentFrames} | {_performanceMonitor.GetQualityIndicator()} " +
+        //                                              $"{_performanceMonitor.GetStatusString()}";
+        //                                statusCallback?.Invoke(status);
+        //                            });
+
+        //                            MetricsUpdated?.Invoke(_performanceMonitor);
+        //                        }
+        //                    }
+        //                }
+        //                else
+        //                {
+        //                    _performanceMonitor.RecordDroppedFrame();
+        //                }
+        //            }
+        //        }
+        //        finally
+        //        {
+        //            mainD3D.ImmediateContext.UnmapSubresource(stage, 0);
+        //        }
+        //    }
+        //    catch (Exception encErr)
+        //    {
+        //        WriteLog($"❌ Encode error: {encErr.Message}");
+        //        _performanceMonitor.RecordDroppedFrame();
+        //        dispatcher?.Invoke(() =>
+        //        {
+        //            statusCallback?.Invoke($"Encoder issue: {encErr.Message}");
+        //        });
+        //    }
+        //}
+
+        public void EncodeAndSendFrame(Texture2D tex, SharpDX.Direct3D11.Texture2DDescription desc,
+    Device mainD3D, UdpClient udpClient, IPEndPoint remoteTarget,
+    Dispatcher dispatcher = null, Action<string> statusCallback = null)
         {
             if (_videoEnc == null) return;
 
+            int expectedRawSize = desc.Width * desc.Height * 4;
+            int expectedBgrSize = desc.Width * desc.Height * 3;
+
+            if (_scratchFrame == null || _bgrFrame == null ||
+                _scratchFrame.Length != expectedRawSize || _bgrFrame.Length != expectedBgrSize)
+            {
+                WriteLog($"⚠️ Size mismatch! Frame: {desc.Width}x{desc.Height}, Buffer: {_scratchFrame?.Length ?? 0} bytes. Skipping frame.");
+                _performanceMonitor.RecordDroppedFrame();
+                return;
+            }
+
+            long frameStartTime = _frameTimer.ElapsedMilliseconds;
+
             try
             {
+                // Check if we need to force an I-Frame
+                if (_forceNextIFrame)
+                {
+                    WriteLog("🎯 FORCING I-FRAME (IDR) due to request");
+                    _videoEnc.ForceIntraFrame();
+                    _forceNextIFrame = false;
+                }
+
                 var d = tex.Description;
                 d.CpuAccessFlags = SharpDX.Direct3D11.CpuAccessFlags.Read;
                 d.Usage = ResourceUsage.Staging;
@@ -118,8 +326,6 @@ namespace sender
                     {
                         var p = (byte*)mapped.DataPointer;
                         int strideBytes = d.Width * 4;
-
-                        // Copy BGRA data to scratch buffer
                         for (int y = 0; y < d.Height; y++)
                         {
                             Marshal.Copy((IntPtr)(p + y * mapped.RowPitch),
@@ -129,13 +335,18 @@ namespace sender
                         }
                     }
 
-                    // Convert BGRA to BGR (remove alpha channel)
-                    ConvertBgraToBgr(_scratchFrame, _bgrFrame, d.Width, d.Height);
+                    // ✅ ניתוח שינוי פיקסלים
+                    double changePercent = _pixelDetector.AnalyzeFrame(_scratchFrame, d.Width, d.Height);
+                    _performanceMonitor.CurrentMotionLevel = _pixelDetector.CurrentMotionLevel;
+                    WriteLog($"📊 Motion detected: {_pixelDetector.GetMotionDescription()}");
 
-                    // Still pass BGRA for preview display
+                    // ✅ תגובה מיידית לתנועה - זה החלק החדש!
+                    AdjustQualityForMotion(_pixelDetector.CurrentMotionLevel, d.Width, d.Height, dispatcher, statusCallback);
+
+                    // המרת BGRA ל-BGR
+                    ConvertBgraToBgr(_scratchFrame, _bgrFrame, d.Width, d.Height);
                     FrameDataReady?.Invoke(_scratchFrame, d.Width, d.Height);
 
-                    // Encode using BGR (3 bytes per pixel)
                     using (var bgr = new RgbImage(ImageFormat.Bgr, d.Width, d.Height, _bgrFrame))
                     {
                         if (_videoEnc.Encode(bgr, out var outFrames))
@@ -144,20 +355,43 @@ namespace sender
 
                             if (encodedBytes != null && encodedBytes.Length > 0)
                             {
+                                long encodeTime = _frameTimer.ElapsedMilliseconds - frameStartTime;
+
                                 AnalyzeEncodedFrame(encodedBytes, outFrames.Length);
                                 SendFrameInChunks(encodedBytes, udpClient, remoteTarget);
 
                                 _sentFrames++;
                                 _totalBytes += encodedBytes.Length;
 
+                                // Record frame metrics
+                                _performanceMonitor.RecordFrame(encodedBytes.Length, encodeTime);
+
+                                // Check if quality adjustment is needed
+                                if (_adaptiveQualityEnabled && _qualityController.UpdateQuality())
+                                {
+                                    WriteLog($"🔧 Quality adjusted: {_qualityController.GetSettingsDescription()}");
+
+                                    // Re-initialize encoder with new settings
+                                    ReinitializeWithNewQuality(d.Width, d.Height, dispatcher, statusCallback);
+                                }
+
+                                // Update UI with metrics
                                 if (_sentFrames % 15 == 0 || _sentFrames <= 3)
                                 {
                                     dispatcher?.Invoke(() =>
                                     {
-                                        statusCallback?.Invoke($"Frame #{_sentFrames} | {encodedBytes.Length} bytes | Total {_totalBytes / 1024.0 / 1024.0:F2}MB");
+                                        string status = $"Frame #{_sentFrames} | {_performanceMonitor.GetQualityIndicator()} " +
+                                                      $"{_performanceMonitor.GetStatusString()}";
+                                        statusCallback?.Invoke(status);
                                     });
+
+                                    MetricsUpdated?.Invoke(_performanceMonitor);
                                 }
                             }
+                        }
+                        else
+                        {
+                            _performanceMonitor.RecordDroppedFrame();
                         }
                     }
                 }
@@ -169,6 +403,7 @@ namespace sender
             catch (Exception encErr)
             {
                 WriteLog($"❌ Encode error: {encErr.Message}");
+                _performanceMonitor.RecordDroppedFrame();
                 dispatcher?.Invoke(() =>
                 {
                     statusCallback?.Invoke($"Encoder issue: {encErr.Message}");
@@ -176,20 +411,160 @@ namespace sender
             }
         }
 
+        /// <summary>
+        /// התאם איכות באופן מיידי בהתאם לרמת התנועה
+        /// </summary>
+        private void AdjustQualityForMotion(MotionLevel currentMotion, int width, int height,
+            Dispatcher dispatcher, Action<string> statusCallback)
+        {
+            // בדוק אם רמת התנועה השתנתה
+            if (currentMotion != _lastMotionLevel)
+            {
+                _motionStableFrames = 1;
+                _lastMotionLevel = currentMotion;
+                return; // לא משנים מיד - מחכים לאישור
+            }
+            else
+            {
+                _motionStableFrames++;
+            }
+
+            // צריך 3 פריימים עקביים לפני שינוי
+            if (_motionStableFrames < MOTION_CHANGE_THRESHOLD)
+            {
+                return;
+            }
+
+            bool needsAdjustment = false;
+            int newBitrate = _qualityController.TargetBitrate;
+
+            // ✅ התאם bitrate לפי רמת תנועה
+            switch (currentMotion)
+            {
+                case MotionLevel.VeryHigh:
+                    // תנועה אקסטרימית - הורד ל-1.5 Mbps
+                    if (_qualityController.TargetBitrate > 1500000)
+                    {
+                        newBitrate = 1500000;
+                        needsAdjustment = true;
+                        WriteLog("🔥 VeryHigh motion - reducing to 1.5 Mbps for max FPS");
+                    }
+                    break;
+
+                case MotionLevel.High:
+                    // תנועה גבוהה - הורד ל-2 Mbps
+                    if (_qualityController.TargetBitrate > 2000000)
+                    {
+                        newBitrate = 2000000;
+                        needsAdjustment = true;
+                        WriteLog("⚡ High motion - reducing to 2 Mbps for high FPS");
+                    }
+                    break;
+
+                case MotionLevel.Medium:
+                    // תנועה בינונית - 3 Mbps
+                    if (_qualityController.TargetBitrate > 3500000 || _qualityController.TargetBitrate < 2500000)
+                    {
+                        newBitrate = 3000000;
+                        needsAdjustment = true;
+                        WriteLog("🏃 Medium motion - adjusting to 3 Mbps");
+                    }
+                    break;
+
+                case MotionLevel.Low:
+                    // תנועה נמוכה - 4 Mbps
+                    if (_qualityController.TargetBitrate > 5000000 || _qualityController.TargetBitrate < 3000000)
+                    {
+                        newBitrate = 4000000;
+                        needsAdjustment = true;
+                        WriteLog("🚶 Low motion - increasing to 4 Mbps");
+                    }
+                    break;
+
+                case MotionLevel.VeryLow:
+                    // כמעט סטטי - 5 Mbps (איכות מקסימלית)
+                    if (_qualityController.TargetBitrate < 4500000)
+                    {
+                        newBitrate = 5000000;
+                        needsAdjustment = true;
+                        WriteLog("🧘 VeryLow motion - increasing to 5 Mbps for max quality");
+                    }
+                    break;
+            }
+
+            // ביצע את השינוי אם נדרש
+            if (needsAdjustment)
+            {
+                _qualityController.SetBitrate(newBitrate);
+                ReinitializeWithNewQuality(width, height, dispatcher, statusCallback);
+                _motionStableFrames = 0; // Reset
+                WriteLog($"🔧 Quality adjusted for {currentMotion} motion: {newBitrate / 1000000.0:F1} Mbps");
+            }
+        }
+
+        private void OnQualityAdjusted(int bitrate, float fps, QualityPreset preset)
+        {
+            WriteLog($"📊 Quality changed: {preset} | {bitrate / 1000000.0:F1} Mbps @ {fps:F0} FPS");
+        }
+
+        private void ReinitializeWithNewQuality(int width, int height, Dispatcher dispatcher, Action<string> statusCallback)
+        {
+            try
+            {
+                // Get current parameters
+                var encParams = _videoEnc.GetDefaultParameters();
+
+                // Update with new quality settings
+                encParams.iPicWidth = width;
+                encParams.iPicHeight = height;
+                encParams.iTargetBitrate = _qualityController.TargetBitrate;
+                encParams.fMaxFrameRate = _qualityController.TargetFPS;
+
+                encParams.iUsageType = EUsageType.SCREEN_CONTENT_REAL_TIME;
+                encParams.iRCMode = RC_MODES.RC_BITRATE_MODE;
+                encParams.iComplexityMode = ECOMPLEXITY_MODE.LOW_COMPLEXITY;
+
+                encParams.iTemporalLayerNum = 1;
+                encParams.iSpatialLayerNum = 1;
+
+                encParams.sSpatialLayers[0].iVideoWidth = width;
+                encParams.sSpatialLayers[0].iVideoHeight = height;
+                encParams.sSpatialLayers[0].fFrameRate = _qualityController.TargetFPS;
+                encParams.sSpatialLayers[0].iSpatialBitrate = _qualityController.TargetBitrate;
+
+                encParams.bEnableFrameSkip = false;
+                encParams.uiIntraPeriod = 30;
+
+                // Re-initialize encoder
+                _videoEnc.Dispose();
+                _videoEnc = new H264Encoder();
+                _videoEnc.Initialize(encParams);
+
+                WriteLog($"✅ Encoder re-initialized with new quality settings");
+            }
+            catch (Exception ex)
+            {
+                WriteLog($"❌ Failed to re-initialize encoder: {ex.Message}");
+            }
+        }
+
+        public void SetAdaptiveQuality(bool enabled)
+        {
+            _adaptiveQualityEnabled = enabled;
+            WriteLog($"🔧 Adaptive quality: {(enabled ? "ENABLED" : "DISABLED")}");
+        }
+
         private void ConvertBgraToBgr(byte[] bgra, byte[] bgr, int width, int height)
         {
-            // Simply strip the alpha channel
-            // BGRA: B G R A B G R A ...
-            // BGR:  B G R B G R ...
             int bgraIdx = 0;
             int bgrIdx = 0;
 
             for (int i = 0; i < width * height; i++)
             {
-                bgr[bgrIdx++] = bgra[bgraIdx++]; // B
-                bgr[bgrIdx++] = bgra[bgraIdx++]; // G
-                bgr[bgrIdx++] = bgra[bgraIdx++]; // R
-                bgraIdx++; // Skip A
+                bgr[bgrIdx++] = bgra[bgraIdx++];
+                bgr[bgrIdx++] = bgra[bgraIdx++];
+                bgr[bgrIdx++] = bgra[bgraIdx++];
+                bgraIdx++;
             }
         }
 
@@ -218,11 +593,6 @@ namespace sender
             string nalInfo = $"SPS={hasSPS}, PPS={hasPPS}, IDR={hasIDR}, P={hasP}";
 
             WriteLog($"📊 Frame #{_sentFrames + 1}: {frameType} | {data.Length} bytes | EncodedData count: {numEncodedData} | NALs: {nalInfo}");
-
-            if (hasIDR && (hasSPS || hasPPS))
-            {
-                WriteLog($"   ✅ H264Sharp automatically included SPS/PPS with IDR frame");
-            }
         }
 
         private void SendFrameInChunks(byte[] frameData, UdpClient udpClient, IPEndPoint remoteTarget)
@@ -233,39 +603,62 @@ namespace sender
                 return;
             }
 
-            int totalChunks = (int)Math.Ceiling((double)frameData.Length / MAX_PAYLOAD_SIZE);
+            _frameNumber++;
 
-            WriteLog($"📤 Sending frame: {frameData.Length} bytes → {totalChunks} chunks to {remoteTarget}");
+            // Calculate how many packets we need for this frame
+            // Reserve space for header: "seq#frame#nnn" = roughly 20 bytes max
+            const int MAX_HEADER_SIZE = 30; // Conservative estimate
+            int maxPayloadPerPacket = MAX_UDP_PAYLOAD - MAX_HEADER_SIZE;
 
-            for (int chunkIndex = 0; chunkIndex < totalChunks; chunkIndex++)
+            int totalPackets = (int)Math.Ceiling((double)frameData.Length / maxPayloadPerPacket);
+            string totalPacketsStr = totalPackets.ToString("D3"); // 3 digits: 001, 002, etc.
+
+            WriteLog($"📤 Sending frame #{_frameNumber}: {frameData.Length} bytes → {totalPackets} packets");
+
+            int offset = 0;
+            int packetIndex = 1;
+
+            while (offset < frameData.Length)
             {
-                int offset = chunkIndex * MAX_PAYLOAD_SIZE;
-                int payloadSize = Math.Min(MAX_PAYLOAD_SIZE, frameData.Length - offset);
-                bool isLastChunk = (chunkIndex == totalChunks - 1);
+                _sequenceNumber++;
 
-                byte[] packet = new byte[HEADER_SIZE + payloadSize];
+                // Build header: "seq#frame#nnn"
+                string header = $"{_sequenceNumber}#{_frameNumber}#{totalPacketsStr}";
+                byte[] headerBytes = System.Text.Encoding.ASCII.GetBytes(header);
 
-                BitConverter.GetBytes(payloadSize).CopyTo(packet, 0);
-                packet[4] = (byte)(isLastChunk ? 1 : 0);
+                // Calculate how much payload we can fit
+                int availableSpace = MAX_UDP_PAYLOAD - MAX_HEADER_SIZE;
+                int payloadSize = Math.Min(availableSpace, frameData.Length - offset);
 
-                System.Buffer.BlockCopy(frameData, offset, packet, HEADER_SIZE, payloadSize);
+                // Build complete packet: header + payload
+                byte[] packet = new byte[headerBytes.Length + payloadSize];
+
+                // Copy header
+                System.Buffer.BlockCopy(headerBytes, 0, packet, 0, headerBytes.Length);
+
+                // Copy payload
+                System.Buffer.BlockCopy(frameData, offset, packet, headerBytes.Length, payloadSize);
 
                 try
                 {
                     int bytesSent = udpClient.Send(packet, packet.Length, remoteTarget);
 
-                    if (chunkIndex == 0 || chunkIndex == totalChunks - 1)
+                    if (packetIndex == 1 || packetIndex == totalPackets)
                     {
-                        WriteLog($"  ✅ Chunk {chunkIndex + 1}/{totalChunks}: sent {bytesSent} bytes (payload: {payloadSize}, isLast: {isLastChunk})");
+                        WriteLog($"  ✅ Packet {packetIndex}/{totalPackets}: Seq={_sequenceNumber}, " +
+                                $"Header={headerBytes.Length}B, Payload={payloadSize}B, Total={bytesSent}B");
                     }
                 }
                 catch (Exception ex)
                 {
-                    WriteLog($"  ❌ FAILED chunk {chunkIndex + 1}: {ex.Message}");
+                    WriteLog($"  ❌ FAILED packet {packetIndex}/{totalPackets}, Seq={_sequenceNumber}: {ex.Message}");
                 }
+
+                offset += payloadSize;
+                packetIndex++;
             }
 
-            WriteLog($"✅ Frame #{_sentFrames + 1} sent: {totalChunks} chunks");
+            WriteLog($"✅ Frame #{_frameNumber} sent: {totalPackets} packets (Seq {_sequenceNumber - totalPackets + 1} to {_sequenceNumber})");
             WriteLog("─────────────────────────────────────────");
         }
 
@@ -282,7 +675,8 @@ namespace sender
 
         public void DisposeEncoder()
         {
-            WriteLog("🛑 Encoder disposed");
+            WriteLog($"🛑 Encoder disposed. Final stats: {_performanceMonitor.GetStatusString()}");
+            WriteLog($"📊 Total I-Frame requests received: {_iframeRequestsReceived}");
             _videoEnc?.Dispose();
             _videoEnc = null;
         }
@@ -290,6 +684,114 @@ namespace sender
         public void Dispose()
         {
             DisposeEncoder();
+        }
+    }
+
+    /// <summary>
+    /// Listens for I-Frame requests from the receiver on video port + 1
+    /// </summary>
+    internal class IFrameRequestListener : IDisposable
+    {
+        private UdpClient _controlListener;
+        private CancellationTokenSource _cancellationTokenSource;
+        private Task _listenTask;
+        private int _listenPort;
+        private readonly string _logPath = "iframe_listener.log";
+
+        public event Action IFrameRequested;
+
+        /// <param name="videoPort">The main video streaming port (control will be videoPort + 1)</param>
+        public IFrameRequestListener(int videoPort)
+        {
+            _listenPort = videoPort + 2; // Control port = video port + 2
+
+            if (File.Exists(_logPath))
+            {
+                File.Delete(_logPath);
+            }
+            LogToFile($"🎧 IFrameRequestListener initialized on port {_listenPort} (video port {videoPort} + 1)");
+        }
+
+        public void StartListening()
+        {
+            try
+            {
+                _controlListener = new UdpClient(_listenPort);
+                _cancellationTokenSource = new CancellationTokenSource();
+                _listenTask = Task.Run(() => ListenLoop(_cancellationTokenSource.Token));
+
+                LogToFile($"▶️ Started listening for I-Frame requests on port {_listenPort}");
+            }
+            catch (Exception ex)
+            {
+                LogToFile($"❌ Failed to start listener: {ex.Message}");
+                throw;
+            }
+        }
+
+        private async Task ListenLoop(CancellationToken ct)
+        {
+            LogToFile("🔄 Listen loop started");
+
+            while (!ct.IsCancellationRequested)
+            {
+                try
+                {
+                    var result = await _controlListener.ReceiveAsync();
+                    string message = Encoding.ASCII.GetString(result.Buffer);
+
+                    if (message == "IFRAME_REQUEST")
+                    {
+                        LogToFile($"📥 I-Frame request received from {result.RemoteEndPoint}");
+                        IFrameRequested?.Invoke();
+                    }
+                    else
+                    {
+                        LogToFile($"⚠️ Unknown control message: '{message}' from {result.RemoteEndPoint}");
+                    }
+                }
+                catch (ObjectDisposedException)
+                {
+                    LogToFile("⚠️ Listener disposed, exiting loop");
+                    break;
+                }
+                catch (Exception ex)
+                {
+                    LogToFile($"❌ Listen error: {ex.Message}");
+                }
+            }
+
+            LogToFile("🛑 Listen loop ended");
+        }
+
+        public void StopListening()
+        {
+            LogToFile("🛑 Stopping listener...");
+
+            _cancellationTokenSource?.Cancel();
+            _listenTask?.Wait(TimeSpan.FromSeconds(2));
+        }
+
+        private void LogToFile(string message)
+        {
+            try
+            {
+                File.AppendAllText(_logPath, $"[{DateTime.Now:HH:mm:ss.fff}] {message}\n");
+            }
+            catch
+            {
+            }
+        }
+
+        public void Dispose()
+        {
+            StopListening();
+
+            _controlListener?.Close();
+            _controlListener?.Dispose();
+            _controlListener = null;
+
+            LogToFile("🗑️ IFrameRequestListener disposed");
         }
     }
 
@@ -301,6 +803,7 @@ namespace sender
         public SizeInt32? LastSize => _lastSize;
 
         public event Action<Texture2D, SharpDX.Direct3D11.Texture2DDescription> FrameReady;
+        public event Action<int, int> SizeChanged;
 
         private GraphicsCaptureItem _captureItem;
         private Direct3D11CaptureFramePool _framePool;
@@ -316,7 +819,8 @@ namespace sender
         public FrameCapturer()
         {
             _udpClient = new UdpClient();
-            _remoteTarget = new IPEndPoint(IPAddress.Loopback, 12345);
+            //_remoteTarget = new IPEndPoint(IPAddress.Loopback, 12345);
+            _remoteTarget = new IPEndPoint(IPAddress.Parse("10.100.102.25"), 12345);
         }
 
         public void InitD3D()
@@ -325,18 +829,73 @@ namespace sender
             _winRTDevice = Direct3D11Helper.CreateDevice(_mainD3D);
         }
 
-        public async System.Threading.Tasks.Task StartCaptureAsync(Window win)
+        private bool IsMonitor(GraphicsCaptureItem item)
         {
-            var picker = new GraphicsCapturePicker();
-            var hwnd = new WindowInteropHelper(win).Handle;
-
-            WinRT.Interop.InitializeWithWindow.Initialize(picker, hwnd);
-
-            _captureItem = await picker.PickSingleItemAsync();
-            if (_captureItem == null)
+            // דרך 1: לפי שם
+            if (item.DisplayName.Contains("Display") ||
+                item.DisplayName.Contains("Monitor") ||
+                item.DisplayName.Contains("מסך"))
             {
-                return;
+                return true;
             }
+
+            // דרך 2: לפי גודל (מסכים בדרך כלל גדולים מחלונות)
+            if (item.Size.Width >= 1920 && item.Size.Height >= 1080)
+            {
+                return true;
+            }
+
+            return false;
+        }
+
+        public async System.Threading.Tasks.Task StartCaptureAsync(System.Windows.Window win)
+        {
+            //var picker = new GraphicsCapturePicker();
+            //var hwnd = new System.Windows.Interop.WindowInteropHelper(win).Handle;
+
+            //WinRT.Interop.InitializeWithWindow.Initialize(picker, hwnd);
+
+            //_captureItem = await picker.PickSingleItemAsync();
+            //if (_captureItem == null)
+            //{
+            //    return;
+            //}
+
+            GraphicsCaptureItem captureItem = null;
+
+            // 🔁 לולאה עד שנקבל מסך תקין
+            while (captureItem == null)
+            {
+                var picker = new GraphicsCapturePicker();
+                var hwnd = new System.Windows.Interop.WindowInteropHelper(win).Handle;
+                WinRT.Interop.InitializeWithWindow.Initialize(picker, hwnd);
+
+                var selected = await picker.PickSingleItemAsync();
+
+                if (selected == null)
+                {
+                    // ביטול - צא מהלולאה
+                    MessageBox.Show("פעולה בוטלה", "ביטול", MessageBoxButton.OK, MessageBoxImage.Information);
+                    return;
+                }
+
+                // ✅ בדיקה: האם זה מסך?
+                if (IsMonitor(selected))
+                {
+                    captureItem = selected; // ✅ מסך תקין!
+                }
+                else
+                {
+                    MessageBox.Show(
+                        "❌ נבחר חלון במקום מסך!\n\n🔄 נא לבחור מסך שלם (Display 1, Display 2...)",
+                        "בחירה שגויה",
+                        MessageBoxButton.OK,
+                        MessageBoxImage.Warning);
+                    // הלולאה תמשיך...
+                }
+            }
+
+            _captureItem = captureItem;
 
             _lastSize = _captureItem.Size;
 
@@ -379,6 +938,8 @@ namespace sender
                 if (!_lastSize.HasValue || sz.Width != _lastSize.Value.Width || sz.Height != _lastSize.Value.Height)
                 {
                     _lastSize = sz;
+
+                    SizeChanged?.Invoke(sz.Width, sz.Height);
 
                     _framePool.Recreate(
                         _winRTDevice,

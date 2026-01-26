@@ -1,45 +1,138 @@
 ﻿<Window x:Class="Receiver.MainWindow"
         xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="Video Stream Receiver" Height="600" Width="900"
+        Title="Video Stream Receiver - Performance Monitor" Height="700" Width="1000"
         WindowStartupLocation="CenterScreen">
     <Grid>
         <Grid.RowDefinitions>
-            <RowDefinition Height="*"/>
             <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="*"/>
             <RowDefinition Height="Auto"/>
         </Grid.RowDefinitions>
 
-        <!-- Video Display Area -->
-        <Border Grid.Row="0" Background="Black" Margin="10">
-            <Image x:Name="DisplayImage" Stretch="Uniform"/>
+        <!-- Control Panel -->
+        <Border Grid.Row="0" Background="#2C3E50" Padding="10">
+            <StackPanel Orientation="Horizontal" HorizontalAlignment="Center">
+                <Button x:Name="StartButton" 
+                        Content="▶ Start Receiving" 
+                        Width="140" Height="35" Margin="5"
+                        Click="StartButton_Click"
+                        Background="#27AE60" Foreground="White"
+                        FontWeight="Bold" FontSize="13"/>
+                <Button x:Name="StopButton" 
+                        Content="⏹ Stop" 
+                        Width="140" Height="35" Margin="5"
+                        IsEnabled="False"
+                        Click="StopButton_Click"
+                        Background="#E74C3C" Foreground="White"
+                        FontWeight="Bold" FontSize="13"/>
+            </StackPanel>
         </Border>
 
-        <!-- Status Text -->
-        <TextBlock x:Name="StatusText" 
-                   Grid.Row="1" 
-                   Text="Ready to receive" 
-                   Margin="10,5"
-                   FontSize="14"/>
+        <!-- Performance Metrics Panel -->
+        <Border Grid.Row="1" Background="#34495E" Padding="10" Margin="0,2">
+            <Grid>
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="*"/>
+                    <ColumnDefinition Width="*"/>
+                    <ColumnDefinition Width="*"/>
+                    <ColumnDefinition Width="*"/>
+                    <ColumnDefinition Width="*"/>
+                    <ColumnDefinition Width="Auto"/>
+                </Grid.ColumnDefinitions>
 
-        <!-- Control Buttons -->
-        <StackPanel Grid.Row="2" 
-                    Orientation="Horizontal" 
-                    HorizontalAlignment="Center" 
-                    Margin="10">
-            <Button x:Name="StartButton" 
-                    Content="Start Receiving" 
-                    Width="120" 
-                    Height="30" 
-                    Margin="5"
-                    Click="StartButton_Click"/>
-            <Button x:Name="StopButton" 
-                    Content="Stop" 
-                    Width="120" 
-                    Height="30" 
-                    Margin="5"
-                    IsEnabled="False"
-                    Click="StopButton_Click"/>
-        </StackPanel>
+                <!-- FPS -->
+                <StackPanel Grid.Column="0" Margin="5,0">
+                    <TextBlock Text="DECODE FPS" Foreground="#95A5A6" FontSize="10" FontWeight="Bold"/>
+                    <StackPanel Orientation="Horizontal">
+                        <TextBlock x:Name="FpsText" Text="0.0" 
+                                   Foreground="#ECF0F1" FontSize="18" FontWeight="Bold"/>
+                        <TextBlock Text=" fps" Foreground="#BDC3C7" FontSize="11" 
+                                   VerticalAlignment="Bottom" Margin="2,0,0,2"/>
+                    </StackPanel>
+                </StackPanel>
+
+                <!-- Bitrate -->
+                <StackPanel Grid.Column="1" Margin="5,0">
+                    <TextBlock Text="BITRATE" Foreground="#95A5A6" FontSize="10" FontWeight="Bold"/>
+                    <StackPanel Orientation="Horizontal">
+                        <TextBlock x:Name="BitrateText" Text="0.0" 
+                                   Foreground="#ECF0F1" FontSize="18" FontWeight="Bold"/>
+                        <TextBlock Text=" Mbps" Foreground="#BDC3C7" FontSize="11" 
+                                   VerticalAlignment="Bottom" Margin="2,0,0,2"/>
+                    </StackPanel>
+                </StackPanel>
+
+                <!-- Latency -->
+                <StackPanel Grid.Column="2" Margin="5,0">
+                    <TextBlock Text="DECODE TIME" Foreground="#95A5A6" FontSize="10" FontWeight="Bold"/>
+                    <StackPanel Orientation="Horizontal">
+                        <TextBlock x:Name="LatencyText" Text="0" 
+                                   Foreground="#ECF0F1" FontSize="18" FontWeight="Bold"/>
+                        <TextBlock Text=" ms" Foreground="#BDC3C7" FontSize="11" 
+                                   VerticalAlignment="Bottom" Margin="2,0,0,2"/>
+                    </StackPanel>
+                </StackPanel>
+
+                <!-- Packet Loss -->
+                <StackPanel Grid.Column="3" Margin="5,0">
+                    <TextBlock Text="PACKET LOSS" Foreground="#95A5A6" FontSize="10" FontWeight="Bold"/>
+                    <StackPanel Orientation="Horizontal">
+                        <TextBlock x:Name="PacketLossText" Text="0.0" 
+                                   Foreground="#ECF0F1" FontSize="18" FontWeight="Bold"/>
+                        <TextBlock Text=" %" Foreground="#BDC3C7" FontSize="11" 
+                                   VerticalAlignment="Bottom" Margin="2,0,0,2"/>
+                    </StackPanel>
+                </StackPanel>
+
+                <!-- Total Frames -->
+                <StackPanel Grid.Column="4" Margin="5,0">
+                    <TextBlock Text="FRAMES" Foreground="#95A5A6" FontSize="10" FontWeight="Bold"/>
+                    <StackPanel Orientation="Horizontal">
+                        <TextBlock x:Name="TotalFramesText" Text="0" 
+                                   Foreground="#ECF0F1" FontSize="18" FontWeight="Bold"/>
+                        <TextBlock Text="" Foreground="#BDC3C7" FontSize="11" 
+                                   VerticalAlignment="Bottom" Margin="2,0,0,2"/>
+                    </StackPanel>
+                </StackPanel>
+
+                <!-- Quality Indicator -->
+                <StackPanel Grid.Column="5" Margin="15,0" VerticalAlignment="Center">
+                    <TextBlock Text="QUALITY" Foreground="#95A5A6" FontSize="10" FontWeight="Bold" 
+                               HorizontalAlignment="Center"/>
+                    <TextBlock x:Name="QualityIndicator" Text="🟢" 
+                               FontSize="28" HorizontalAlignment="Center"/>
+                </StackPanel>
+            </Grid>
+        </Border>
+
+        <!-- Video Display Area -->
+        <Border Grid.Row="2" Background="Black" Margin="10" 
+                BorderBrush="#7F8C8D" BorderThickness="2">
+            <Viewbox Stretch="Uniform">
+                <Image x:Name="DisplayImage" 
+                       Stretch="Uniform"
+                       StretchDirection="Both"
+                       RenderOptions.BitmapScalingMode="HighQuality"/>
+            </Viewbox>
+        </Border>
+
+        <!-- Status Bar -->
+        <Border Grid.Row="3" Background="#2C3E50" Padding="8">
+            <Grid>
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="Auto"/>
+                    <ColumnDefinition Width="*"/>
+                </Grid.ColumnDefinitions>
+
+                <TextBlock Grid.Column="0" Text="📊" FontSize="14" 
+                           VerticalAlignment="Center" Margin="0,0,8,0"/>
+                <TextBlock x:Name="StatusText" Grid.Column="1"
+                           Text="Ready to receive" 
+                           Foreground="#ECF0F1" FontSize="12"
+                           VerticalAlignment="Center"/>
+            </Grid>
+        </Border>
     </Grid>
 </Window>
