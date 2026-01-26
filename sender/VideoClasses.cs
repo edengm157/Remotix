@@ -1,4 +1,6 @@
-﻿using System;
+﻿using H264Sharp;
+using SharpDX.Direct3D11;
+using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Net;
@@ -7,15 +9,15 @@ using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
+using System.Windows;
+using System.Windows.Media.Media3D;
 using System.Windows.Threading;
-using SharpDX.Direct3D11;
-using H264Sharp;
 using Windows.Graphics;
 using Windows.Graphics.Capture;
 using Windows.Graphics.DirectX.Direct3D11;
-using MapFlags = SharpDX.Direct3D11.MapFlags;
-using Device = SharpDX.Direct3D11.Device;
 using WinRT;
+using Device = SharpDX.Direct3D11.Device;
+using MapFlags = SharpDX.Direct3D11.MapFlags;
 
 namespace sender
 {
@@ -29,6 +31,9 @@ namespace sender
         private int _sentFrames = 0;
 
         private readonly string _logPath = "h264_sent.log";
+
+        private PixelChangeDetector _pixelDetector = new PixelChangeDetector();
+        private PerformanceMonitor _monitor;
 
         private long _sequenceNumber = 0;
         private long _frameNumber = 0;
@@ -45,6 +50,10 @@ namespace sender
         private bool _adaptiveQualityEnabled = true;
         private System.Diagnostics.Stopwatch _frameTimer = new System.Diagnostics.Stopwatch();
 
+        private MotionLevel _lastMotionLevel = MotionLevel.Unknown;
+        private int _motionStableFrames = 0;
+        private const int MOTION_CHANGE_THRESHOLD = 3; // צריך 3 פריימים עקביים לשינוי
+
         public event Action<byte[], int, int> FrameDataReady;
         public event Action<PerformanceMonitor> MetricsUpdated;
 
@@ -54,6 +63,7 @@ namespace sender
 
         public VideoEncoder()
         {
+
             if (File.Exists(_logPath))
             {
                 File.Delete(_logPath);
@@ -141,9 +151,138 @@ namespace sender
             WriteLog($"📥 I-FRAME REQUEST RECEIVED (#{_iframeRequestsReceived}) - will force IDR on next frame");
         }
 
+        //public void EncodeAndSendFrame(Texture2D tex, SharpDX.Direct3D11.Texture2DDescription desc,
+        //    Device mainD3D, UdpClient udpClient, IPEndPoint remoteTarget,
+        //    Dispatcher dispatcher = null, Action<string> statusCallback = null)
+        //{
+        //    if (_videoEnc == null) return;
+
+        //    int expectedRawSize = desc.Width * desc.Height * 4;
+        //    int expectedBgrSize = desc.Width * desc.Height * 3;
+
+        //    if (_scratchFrame == null || _bgrFrame == null ||
+        //        _scratchFrame.Length != expectedRawSize || _bgrFrame.Length != expectedBgrSize)
+        //    {
+        //        WriteLog($"⚠️ Size mismatch! Frame: {desc.Width}x{desc.Height}, Buffer: {_scratchFrame?.Length ?? 0} bytes. Skipping frame.");
+        //        _performanceMonitor.RecordDroppedFrame();
+        //        return;
+        //    }
+
+        //    long frameStartTime = _frameTimer.ElapsedMilliseconds;
+
+        //    try
+        //    {
+        //        // Check if we need to force an I-Frame
+        //        if (_forceNextIFrame)
+        //        {
+        //            WriteLog("🎯 FORCING I-FRAME (IDR) due to request");
+        //            _videoEnc.ForceIntraFrame();
+        //            _forceNextIFrame = false;
+        //        }
+
+        //        var d = tex.Description;
+        //        d.CpuAccessFlags = SharpDX.Direct3D11.CpuAccessFlags.Read;
+        //        d.Usage = ResourceUsage.Staging;
+        //        d.OptionFlags = ResourceOptionFlags.None;
+        //        d.BindFlags = BindFlags.None;
+
+        //        using var stage = new Texture2D(mainD3D, d);
+        //        mainD3D.ImmediateContext.CopyResource(tex, stage);
+
+        //        var mapped = mainD3D.ImmediateContext.MapSubresource(stage, 0, SharpDX.Direct3D11.MapMode.Read, MapFlags.None);
+
+        //        try
+        //        {
+        //            unsafe
+        //            {
+        //                var p = (byte*)mapped.DataPointer;
+        //                int strideBytes = d.Width * 4;
+        //                for (int y = 0; y < d.Height; y++)
+        //                {
+        //                    Marshal.Copy((IntPtr)(p + y * mapped.RowPitch),
+        //                                 _scratchFrame,
+        //                                 y * strideBytes,
+        //                                 strideBytes);
+        //                }
+        //            }
+
+        //            // ✅ ניתוח שינוי פיקסלים - לפני ההמרה
+        //            double changePercent = _pixelDetector.AnalyzeFrame(_scratchFrame, d.Width, d.Height);
+        //            _performanceMonitor.CurrentMotionLevel = _pixelDetector.CurrentMotionLevel;
+        //            WriteLog($"📊 Motion detected: {_pixelDetector.GetMotionDescription()}");
+
+        //            // ✅ המרת BGRA ל-BGR - רק פעם אחת!
+        //            ConvertBgraToBgr(_scratchFrame, _bgrFrame, d.Width, d.Height);
+
+        //            FrameDataReady?.Invoke(_scratchFrame, d.Width, d.Height);
+
+        //            using (var bgr = new RgbImage(ImageFormat.Bgr, d.Width, d.Height, _bgrFrame))
+        //            {
+        //                if (_videoEnc.Encode(bgr, out var outFrames))
+        //                {
+        //                    byte[] encodedBytes = outFrames.GetAllBytes();
+
+        //                    if (encodedBytes != null && encodedBytes.Length > 0)
+        //                    {
+        //                        long encodeTime = _frameTimer.ElapsedMilliseconds - frameStartTime;
+
+        //                        AnalyzeEncodedFrame(encodedBytes, outFrames.Length);
+        //                        SendFrameInChunks(encodedBytes, udpClient, remoteTarget);
+
+        //                        _sentFrames++;
+        //                        _totalBytes += encodedBytes.Length;
+
+        //                        // Record frame metrics
+        //                        _performanceMonitor.RecordFrame(encodedBytes.Length, encodeTime);
+
+        //                        // Check if quality adjustment is needed
+        //                        if (_adaptiveQualityEnabled && _qualityController.UpdateQuality())
+        //                        {
+        //                            WriteLog($"🔧 Quality adjusted: {_qualityController.GetSettingsDescription()}");
+
+        //                            // Re-initialize encoder with new settings
+        //                            ReinitializeWithNewQuality(d.Width, d.Height, dispatcher, statusCallback);
+        //                        }
+
+        //                        // Update UI with metrics
+        //                        if (_sentFrames % 15 == 0 || _sentFrames <= 3)
+        //                        {
+        //                            dispatcher?.Invoke(() =>
+        //                            {
+        //                                string status = $"Frame #{_sentFrames} | {_performanceMonitor.GetQualityIndicator()} " +
+        //                                              $"{_performanceMonitor.GetStatusString()}";
+        //                                statusCallback?.Invoke(status);
+        //                            });
+
+        //                            MetricsUpdated?.Invoke(_performanceMonitor);
+        //                        }
+        //                    }
+        //                }
+        //                else
+        //                {
+        //                    _performanceMonitor.RecordDroppedFrame();
+        //                }
+        //            }
+        //        }
+        //        finally
+        //        {
+        //            mainD3D.ImmediateContext.UnmapSubresource(stage, 0);
+        //        }
+        //    }
+        //    catch (Exception encErr)
+        //    {
+        //        WriteLog($"❌ Encode error: {encErr.Message}");
+        //        _performanceMonitor.RecordDroppedFrame();
+        //        dispatcher?.Invoke(() =>
+        //        {
+        //            statusCallback?.Invoke($"Encoder issue: {encErr.Message}");
+        //        });
+        //    }
+        //}
+
         public void EncodeAndSendFrame(Texture2D tex, SharpDX.Direct3D11.Texture2DDescription desc,
-            Device mainD3D, UdpClient udpClient, IPEndPoint remoteTarget,
-            Dispatcher dispatcher = null, Action<string> statusCallback = null)
+    Device mainD3D, UdpClient udpClient, IPEndPoint remoteTarget,
+    Dispatcher dispatcher = null, Action<string> statusCallback = null)
         {
             if (_videoEnc == null) return;
 
@@ -187,7 +326,6 @@ namespace sender
                     {
                         var p = (byte*)mapped.DataPointer;
                         int strideBytes = d.Width * 4;
-
                         for (int y = 0; y < d.Height; y++)
                         {
                             Marshal.Copy((IntPtr)(p + y * mapped.RowPitch),
@@ -197,6 +335,15 @@ namespace sender
                         }
                     }
 
+                    // ✅ ניתוח שינוי פיקסלים
+                    double changePercent = _pixelDetector.AnalyzeFrame(_scratchFrame, d.Width, d.Height);
+                    _performanceMonitor.CurrentMotionLevel = _pixelDetector.CurrentMotionLevel;
+                    WriteLog($"📊 Motion detected: {_pixelDetector.GetMotionDescription()}");
+
+                    // ✅ תגובה מיידית לתנועה - זה החלק החדש!
+                    AdjustQualityForMotion(_pixelDetector.CurrentMotionLevel, d.Width, d.Height, dispatcher, statusCallback);
+
+                    // המרת BGRA ל-BGR
                     ConvertBgraToBgr(_scratchFrame, _bgrFrame, d.Width, d.Height);
                     FrameDataReady?.Invoke(_scratchFrame, d.Width, d.Height);
 
@@ -261,6 +408,97 @@ namespace sender
                 {
                     statusCallback?.Invoke($"Encoder issue: {encErr.Message}");
                 });
+            }
+        }
+
+        /// <summary>
+        /// התאם איכות באופן מיידי בהתאם לרמת התנועה
+        /// </summary>
+        private void AdjustQualityForMotion(MotionLevel currentMotion, int width, int height,
+            Dispatcher dispatcher, Action<string> statusCallback)
+        {
+            // בדוק אם רמת התנועה השתנתה
+            if (currentMotion != _lastMotionLevel)
+            {
+                _motionStableFrames = 1;
+                _lastMotionLevel = currentMotion;
+                return; // לא משנים מיד - מחכים לאישור
+            }
+            else
+            {
+                _motionStableFrames++;
+            }
+
+            // צריך 3 פריימים עקביים לפני שינוי
+            if (_motionStableFrames < MOTION_CHANGE_THRESHOLD)
+            {
+                return;
+            }
+
+            bool needsAdjustment = false;
+            int newBitrate = _qualityController.TargetBitrate;
+
+            // ✅ התאם bitrate לפי רמת תנועה
+            switch (currentMotion)
+            {
+                case MotionLevel.VeryHigh:
+                    // תנועה אקסטרימית - הורד ל-1.5 Mbps
+                    if (_qualityController.TargetBitrate > 1500000)
+                    {
+                        newBitrate = 1500000;
+                        needsAdjustment = true;
+                        WriteLog("🔥 VeryHigh motion - reducing to 1.5 Mbps for max FPS");
+                    }
+                    break;
+
+                case MotionLevel.High:
+                    // תנועה גבוהה - הורד ל-2 Mbps
+                    if (_qualityController.TargetBitrate > 2000000)
+                    {
+                        newBitrate = 2000000;
+                        needsAdjustment = true;
+                        WriteLog("⚡ High motion - reducing to 2 Mbps for high FPS");
+                    }
+                    break;
+
+                case MotionLevel.Medium:
+                    // תנועה בינונית - 3 Mbps
+                    if (_qualityController.TargetBitrate > 3500000 || _qualityController.TargetBitrate < 2500000)
+                    {
+                        newBitrate = 3000000;
+                        needsAdjustment = true;
+                        WriteLog("🏃 Medium motion - adjusting to 3 Mbps");
+                    }
+                    break;
+
+                case MotionLevel.Low:
+                    // תנועה נמוכה - 4 Mbps
+                    if (_qualityController.TargetBitrate > 5000000 || _qualityController.TargetBitrate < 3000000)
+                    {
+                        newBitrate = 4000000;
+                        needsAdjustment = true;
+                        WriteLog("🚶 Low motion - increasing to 4 Mbps");
+                    }
+                    break;
+
+                case MotionLevel.VeryLow:
+                    // כמעט סטטי - 5 Mbps (איכות מקסימלית)
+                    if (_qualityController.TargetBitrate < 4500000)
+                    {
+                        newBitrate = 5000000;
+                        needsAdjustment = true;
+                        WriteLog("🧘 VeryLow motion - increasing to 5 Mbps for max quality");
+                    }
+                    break;
+            }
+
+            // ביצע את השינוי אם נדרש
+            if (needsAdjustment)
+            {
+                _qualityController.SetBitrate(newBitrate);
+                ReinitializeWithNewQuality(width, height, dispatcher, statusCallback);
+                _motionStableFrames = 0; // Reset
+                WriteLog($"🔧 Quality adjusted for {currentMotion} motion: {newBitrate / 1000000.0:F1} Mbps");
             }
         }
 
@@ -582,7 +820,7 @@ namespace sender
         {
             _udpClient = new UdpClient();
             //_remoteTarget = new IPEndPoint(IPAddress.Loopback, 12345);
-            _remoteTarget = new IPEndPoint(IPAddress.Parse("10.0.0.31"), 12345);
+            _remoteTarget = new IPEndPoint(IPAddress.Parse("10.100.102.25"), 12345);
         }
 
         public void InitD3D()
@@ -591,18 +829,73 @@ namespace sender
             _winRTDevice = Direct3D11Helper.CreateDevice(_mainD3D);
         }
 
+        private bool IsMonitor(GraphicsCaptureItem item)
+        {
+            // דרך 1: לפי שם
+            if (item.DisplayName.Contains("Display") ||
+                item.DisplayName.Contains("Monitor") ||
+                item.DisplayName.Contains("מסך"))
+            {
+                return true;
+            }
+
+            // דרך 2: לפי גודל (מסכים בדרך כלל גדולים מחלונות)
+            if (item.Size.Width >= 1920 && item.Size.Height >= 1080)
+            {
+                return true;
+            }
+
+            return false;
+        }
+
         public async System.Threading.Tasks.Task StartCaptureAsync(System.Windows.Window win)
         {
-            var picker = new GraphicsCapturePicker();
-            var hwnd = new System.Windows.Interop.WindowInteropHelper(win).Handle;
+            //var picker = new GraphicsCapturePicker();
+            //var hwnd = new System.Windows.Interop.WindowInteropHelper(win).Handle;
 
-            WinRT.Interop.InitializeWithWindow.Initialize(picker, hwnd);
+            //WinRT.Interop.InitializeWithWindow.Initialize(picker, hwnd);
 
-            _captureItem = await picker.PickSingleItemAsync();
-            if (_captureItem == null)
+            //_captureItem = await picker.PickSingleItemAsync();
+            //if (_captureItem == null)
+            //{
+            //    return;
+            //}
+
+            GraphicsCaptureItem captureItem = null;
+
+            // 🔁 לולאה עד שנקבל מסך תקין
+            while (captureItem == null)
             {
-                return;
+                var picker = new GraphicsCapturePicker();
+                var hwnd = new System.Windows.Interop.WindowInteropHelper(win).Handle;
+                WinRT.Interop.InitializeWithWindow.Initialize(picker, hwnd);
+
+                var selected = await picker.PickSingleItemAsync();
+
+                if (selected == null)
+                {
+                    // ביטול - צא מהלולאה
+                    MessageBox.Show("פעולה בוטלה", "ביטול", MessageBoxButton.OK, MessageBoxImage.Information);
+                    return;
+                }
+
+                // ✅ בדיקה: האם זה מסך?
+                if (IsMonitor(selected))
+                {
+                    captureItem = selected; // ✅ מסך תקין!
+                }
+                else
+                {
+                    MessageBox.Show(
+                        "❌ נבחר חלון במקום מסך!\n\n🔄 נא לבחור מסך שלם (Display 1, Display 2...)",
+                        "בחירה שגויה",
+                        MessageBoxButton.OK,
+                        MessageBoxImage.Warning);
+                    // הלולאה תמשיך...
+                }
             }
+
+            _captureItem = captureItem;
 
             _lastSize = _captureItem.Size;
 

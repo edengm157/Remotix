@@ -12,9 +12,9 @@ namespace sender
         private readonly PerformanceMonitor _monitor;
 
         // Current encoding parameters
-        public int TargetBitrate { get; private set; } = 5000000; // 5 Mbps default
-        public float TargetFPS { get; private set; } = 15f;
-        public QualityPreset CurrentPreset { get; private set; } = QualityPreset.High;
+        public int TargetBitrate { get; private set; } = 2500000; // 2.5 Mbps
+        public float TargetFPS { get; private set; } = 20f;       // 20 FPS
+        public QualityPreset CurrentPreset { get; private set; } = QualityPreset.Medium;
 
         // Adaptation settings - FAST RESPONSE with hysteresis protection
         private const int ADAPTATION_INTERVAL_MS = 1000; // Check every 1 second
@@ -28,7 +28,7 @@ namespace sender
         private const int POOR_THRESHOLD = 2; // Need 2 consecutive poor readings (2 seconds)
 
         // Bitrate bounds (in bps)
-        private const int MIN_BITRATE = 1000000;  // 1 Mbps
+        private const int MIN_BITRATE = 800000;  // 0.8 Mbps
         private const int MAX_BITRATE = 10000000; // 10 Mbps
 
         // FPS bounds
@@ -51,7 +51,6 @@ namespace sender
         {
             long currentTime = _stopwatch.ElapsedMilliseconds;
 
-            // Only adapt at specified intervals
             if (currentTime - _lastAdaptationTime < ADAPTATION_INTERVAL_MS)
             {
                 return false;
@@ -62,24 +61,45 @@ namespace sender
             var quality = _monitor.Quality;
             var currentFPS = _monitor.CurrentFPS;
             var packetLoss = _monitor.PacketLossPercent;
+            var motionLevel = _monitor.CurrentMotionLevel; // ✅ קח motion level
 
             bool changed = false;
 
-            // SMART ADAPTATION: Only react to extremes
+            // ✅ חדש: תגובה חכמה לפי Motion Level
+            if (motionLevel >= MotionLevel.High && currentFPS < 20)
+            {
+                // תנועה גבוהה + FPS נמוך → הורד BITRATE, לא FPS!
+                changed = ReduceBitrateKeepFPS();
+                if (changed)
+                {
+                    LogAdaptation($"High motion ({motionLevel}) with low FPS ({currentFPS:F1})",
+                                 "Reducing bitrate to improve FPS");
+                }
+            }
+            else if (motionLevel <= MotionLevel.Low && currentFPS > 18 && TargetBitrate < MAX_BITRATE)
+            {
+                // תנועה נמוכה + FPS טוב → אפשר להוריד FPS ולהעלות איכות
+                changed = TradeoffFPSForQuality();
+                if (changed)
+                {
+                    LogAdaptation($"Low motion ({motionLevel}) with good FPS ({currentFPS:F1})",
+                                 "Trading FPS for better quality");
+                }
+            }
+
+            // המשך הלוגיקה הרגילה...
             switch (quality)
             {
                 case StreamQuality.Excellent:
-                    // Increment counter
                     _excellentCount++;
-                    _poorCount = 0; // Reset poor counter
+                    _poorCount = 0;
 
-                    // Only increase quality after sustained excellence
                     if (_excellentCount >= EXCELLENT_THRESHOLD)
                     {
-                        changed = IncreaseQuality();
+                        changed |= IncreaseQuality();
                         if (changed)
                         {
-                            _excellentCount = 0; // Reset after adjustment
+                            _excellentCount = 0;
                             LogAdaptation("Sustained excellent quality detected", "Increasing quality");
                         }
                     }
@@ -87,51 +107,103 @@ namespace sender
 
                 case StreamQuality.Good:
                 case StreamQuality.Fair:
-                    // STABLE ZONE - Do nothing, just reset counters
                     _excellentCount = 0;
                     _poorCount = 0;
-                    // Quality is acceptable, no need to change
                     break;
 
                 case StreamQuality.Poor:
-                    // Increment counter
                     _poorCount++;
-                    _excellentCount = 0; // Reset excellent counter
+                    _excellentCount = 0;
 
-                    // React faster to poor quality (2 checks instead of 3)
                     if (_poorCount >= POOR_THRESHOLD)
                     {
-                        changed = DecreaseQuality(moderate: false);
+                        // ✅ Poor quality - בדוק אם זה בגלל high motion
+                        if (motionLevel >= MotionLevel.High)
+                        {
+                            // תנועה גבוהה - הורד bitrate בעיקר
+                            changed |= ReduceBitrate(0.7); // 70% של הbitrate
+                            if (TargetFPS > MIN_FPS)
+                            {
+                                changed |= ReduceFPS(0.9); // הורד FPS רק קצת (90%)
+                            }
+                        }
+                        else
+                        {
+                            // תנועה נמוכה - הורד גם bitrate גם FPS
+                            changed |= DecreaseQuality(moderate: false);
+                        }
+
                         if (changed)
                         {
-                            _poorCount = 0; // Reset after adjustment
-                            LogAdaptation("Sustained poor quality detected", "Reducing quality aggressively");
+                            _poorCount = 0;
+                            LogAdaptation("Sustained poor quality detected", "Reducing quality");
                         }
                     }
                     break;
             }
 
-            // EMERGENCY HANDLING: React immediately to critical issues
-            // (These bypass the hysteresis counters)
+            // EMERGENCY HANDLING
             if (packetLoss > 10)
             {
-                // Critical packet loss - immediate action
-                changed |= ReduceBitrate(0.6); // Reduce to 60% immediately
+                changed |= ReduceBitrate(0.6);
                 LogAdaptation($"Critical packet loss: {packetLoss:F1}%", "Emergency bitrate reduction");
-                _poorCount = 0; // Reset to avoid double-reduction
+                _poorCount = 0;
             }
             else if (currentFPS < 8 && TargetFPS > MIN_FPS)
             {
-                // Critical FPS drop - immediate action
-                changed |= ReduceFPS(0.7); // Reduce to 70%
+                changed |= ReduceFPS(0.7);
                 LogAdaptation($"Critical FPS drop: {currentFPS:F1}", "Emergency FPS reduction");
-                _poorCount = 0; // Reset to avoid double-reduction
+                _poorCount = 0;
             }
 
             if (changed)
             {
                 UpdatePreset();
                 QualityAdjusted?.Invoke(TargetBitrate, TargetFPS, CurrentPreset);
+            }
+
+            return changed;
+        }
+
+        /// <summary>
+        /// Reduce bitrate aggressively while trying to keep FPS stable
+        /// Used when high motion detected with low FPS
+        /// </summary>
+        private bool ReduceBitrateKeepFPS()
+        {
+            bool changed = false;
+
+            // הורד bitrate בצורה אגרסיבית
+            if (TargetBitrate > MIN_BITRATE)
+            {
+                TargetBitrate = Math.Max(MIN_BITRATE, (int)(TargetBitrate * 0.6)); // 60% של הbitrate
+                changed = true;
+            }
+
+            // אל תוריד FPS! (או הורד רק מעט מאוד)
+
+            return changed;
+        }
+
+        /// <summary>
+        /// Trade FPS for better quality when motion is low
+        /// </summary>
+        private bool TradeoffFPSForQuality()
+        {
+            bool changed = false;
+
+            // הורד FPS קצת
+            if (TargetFPS > 15)
+            {
+                TargetFPS = Math.Max(15, TargetFPS * 0.85f); // 85% של ה-FPS
+                changed = true;
+            }
+
+            // העלה bitrate
+            if (TargetBitrate < MAX_BITRATE)
+            {
+                TargetBitrate = Math.Min(MAX_BITRATE, (int)(TargetBitrate * 1.2)); // 120% של הbitrate
+                changed = true;
             }
 
             return changed;
@@ -198,6 +270,20 @@ namespace sender
                 return true;
             }
             return false;
+        }
+
+        /// <summary>
+        /// Set bitrate directly (for motion-based adjustments)
+        /// </summary>
+        public void SetBitrate(int bitrate)
+        {
+            bitrate = Math.Max(MIN_BITRATE, Math.Min(MAX_BITRATE, bitrate));
+            if (bitrate != TargetBitrate)
+            {
+                TargetBitrate = bitrate;
+                UpdatePreset();
+                LogAdaptation($"⚡ Bitrate set to {TargetBitrate / 1000000.0:F2} Mbps", "DATA");
+            }
         }
 
         /// <summary>
@@ -303,6 +389,90 @@ namespace sender
             // This will appear in h264_sent.log via VideoEncoder
             System.Diagnostics.Debug.WriteLine($"[Adaptation] {reason} → {action}");
         }
+
+        //private void UpdateTargetFPS()
+        //{
+        //    var motion = _monitor.CurrentMotionLevel;
+
+        //    // לוגיקה חכמה לניהול FPS לפי תנועה
+        //    switch (motion)
+        //    {
+        //        case MotionLevel.VeryLow: // מסך סטטי (קריאת טקסט)
+        //            TargetFPS = 5;       // אין סיבה לצלם 30 פעמים בשנייה כשכלום לא זז
+        //            break;
+
+        //        case MotionLevel.Low:     // תנועת עכבר קלה
+        //            TargetFPS = 10;
+        //            break;
+
+        //        case MotionLevel.Medium:  // עבודה רגילה
+        //            TargetFPS = 20;
+        //            break;
+
+        //        case MotionLevel.High:    // וידאו / גלילה
+        //        case MotionLevel.VeryHigh:
+        //            TargetFPS = 30;      // מקסימום חלקות
+        //            break;
+
+        //        default:
+        //            TargetFPS = 15;      // ברירת מחדל
+        //            break;
+        //    }
+
+        //    // כאן אתה יכול להוסיף לוג:
+        //    // Console.WriteLine($"Motion: {motion}, Setting FPS to: {TargetFPS}");
+        //}
+
+        /// <summary>
+        /// מתאים את איכות התמונה (דחיסת JPEG) לפי רמת התנועה במסך
+        /// </summary>
+        //private void UpdateQualityBasedOnMotion()
+        //{
+        //    var motion = _monitor.CurrentMotionLevel;
+
+        //    // נשמור את הפריסט הקודם כדי לדעת אם צריך לדווח על שינוי
+        //    var oldPreset = CurrentPreset;
+
+        //    switch (motion)
+        //    {
+        //        case MotionLevel.VeryHigh: // משחקים / וידאו מלא
+        //                                   // תנועה קיצונית: מורידים איכות דרסטית כדי למנוע תקיעות
+        //            CurrentPreset = QualityPreset.Low;
+        //            break;
+
+        //        case MotionLevel.High:     // גלילה מהירה / יוטיוב
+        //                                   // תנועה גבוהה: איכות בינונית-נמוכה
+        //            CurrentPreset = QualityPreset.Medium;
+        //            break;
+
+        //        case MotionLevel.Medium:   // עבודה רגילה
+        //                                   // תנועה סבירה: איכות גבוהה אבל לא מקסימלית
+        //            CurrentPreset = QualityPreset.High;
+        //            break;
+
+        //        case MotionLevel.Low:      // הזזת עכבר
+        //        case MotionLevel.VeryLow: // כמעט סטטי
+        //                                   // אין תנועה: רוצים לראות טקסט חד וברור (Crisp)
+        //            CurrentPreset = QualityPreset.Ultra;
+        //            break;
+
+        //        default:
+        //            CurrentPreset = QualityPreset.High;
+        //            break;
+        //    }
+
+        //    // אם האיכות השתנתה, נכתוב ללוג
+        //    if (oldPreset != CurrentPreset)
+        //    {
+        //        Console.WriteLine($"[AdaptiveControl] Motion is {motion} -> Adjusted Quality to {CurrentPreset}");
+        //    }
+        //}
+
+        //public void AdjustSettings()
+        //{
+        //    UpdateQualityBasedOnMotion();
+        //    UpdateTargetFPS(); // (הפונקציה מהשלב הקודם שמשנה FPS)
+        //}
     }
 
     /// <summary>

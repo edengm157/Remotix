@@ -39,6 +39,8 @@ namespace sender
             _stopwatch.Start();
         }
 
+        public MotionLevel CurrentMotionLevel { get; set; } = MotionLevel.Unknown;
+
         /// <summary>
         /// Record a new frame for metrics calculation
         /// </summary>
@@ -169,26 +171,54 @@ namespace sender
         /// </summary>
         private void AssessQuality()
         {
-            // Excellent: FPS >= 25, bitrate stable, low latency, no packet loss
-            if (CurrentFPS >= 25 && PacketLossPercent < 1 && AverageLatencyMs < 100)
+            // ✅ סף FPS דינמי לפי תנועה
+            double minAcceptableFPS = CurrentMotionLevel switch
+            {
+                MotionLevel.VeryHigh => 20,  // תנועה גבוהה מאוד → צריך 20+ FPS
+                MotionLevel.High => 18,      // תנועה גבוהה → צריך 18+ FPS
+                MotionLevel.Medium => 15,    // תנועה בינונית → 15+ FPS
+                MotionLevel.Low => 12,       // תנועה נמוכה → 12+ FPS בסדר
+                MotionLevel.VeryLow => 10,   // כמעט סטטי → 10+ FPS מספיק
+                _ => 15
+            };
+
+            // Excellent: FPS טוב, low latency, no packet loss
+            if (CurrentFPS >= minAcceptableFPS + 5 && PacketLossPercent < 1 && AverageLatencyMs < 100)
             {
                 Quality = StreamQuality.Excellent;
             }
-            // Good: FPS >= 20, acceptable bitrate, moderate latency, minimal packet loss
-            else if (CurrentFPS >= 20 && PacketLossPercent < 3 && AverageLatencyMs < 200)
+            // Good: FPS מעל המינימום
+            else if (CurrentFPS >= minAcceptableFPS && PacketLossPercent < 3 && AverageLatencyMs < 200)
             {
                 Quality = StreamQuality.Good;
             }
-            // Fair: FPS >= 15, some issues
-            else if (CurrentFPS >= 15 && PacketLossPercent < 5 && AverageLatencyMs < 300)
+            // Fair: FPS קרוב למינימום
+            else if (CurrentFPS >= minAcceptableFPS - 3 && PacketLossPercent < 5 && AverageLatencyMs < 300)
             {
                 Quality = StreamQuality.Fair;
             }
-            // Poor: Significant issues
+            // Poor: FPS מתחת למינימום
             else
             {
                 Quality = StreamQuality.Poor;
             }
+        }
+
+        /// <summary>
+        /// Get expected minimum FPS based on motion level
+        /// High motion = lower FPS is acceptable
+        /// </summary>
+        private double GetExpectedMinFPS()
+        {
+            return CurrentMotionLevel switch
+            {
+                MotionLevel.VeryHigh => 15,  // הרבה תנועה → 15 FPS זה OK
+                MotionLevel.High => 18,      // תנועה גבוהה → 18 FPS זה OK
+                MotionLevel.Medium => 20,    // תנועה בינונית → 20 FPS
+                MotionLevel.Low => 23,       // תנועה נמוכה → 23 FPS
+                MotionLevel.VeryLow => 25,   // כמעט סטטי → 25 FPS
+                _ => 20                      // ברירת מחדל
+            };
         }
 
         /// <summary>
