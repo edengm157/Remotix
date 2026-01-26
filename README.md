@@ -1,93 +1,301 @@
-# Krayot-02-Remotix
+# Remotix 🚀
+
+**פלטפורמה לשיתוף ושליטה מרחוק בזמן אמת עם דגש על שיתופיות**
+
+> **סטטוס פרויקט:** בפיתוח פעיל
+---
+
+## 📖 תיאור הפרויקט
+
+Remotix היא מערכת לשליטה מרחוק (Remote Desktop) מתקדמת המפותחת ב-C# ו-WPF. בשונה מפתרונות קיימים כמו TeamViewer, AnyDesk או Chrome Remote Desktop, המטרה הסופית של Remotix היא לאפשר שליטה סימולטנית של מספר משתמשים על מחשב אחד (Multi-User Control) - יכולת שלא קיימת כיום בפתרונות המסחריים המובילים.
 
 
+### 🎯 מטרת הפרויקט
 
-## Getting started
+הפרויקט נועד לאפשר שיתוף פעולה מרחוק בזמן אמת לצורכי:
+- 👨‍🏫 **למידה משותפת** - מורים ותלמידים עובדים יחד על אותו מחשב
+- ~🛠️ **תמיכה טכנית צוותית** - מספר טכנאים פותרים בעיה במקביל~
+- ~🎮 **שיתוף פעולה יצירתי** - עבודה משותפת על תוכנה, עיצוב או משחקים~
 
-To make it easy for you to get started with GitLab, here's a list of recommended next steps.
+### 👥 קהל יעד
 
-Already a pro? Just edit this README.md and make it your own. Want to make it easy? [Use the template at the bottom](#editing-this-readme)!
+- ~אנשי תמיכה טכנית העובדים בצוותים~
+- מורים ותלמידים בסביבות לימוד מרוחקות
+- משתמשים פרטיים המעוניינים בשיתוף פעולה על משחקים או תוכנה
+- ~ארגונים המחפשים פתרון פרטי לשליטה מרחוק~
 
-## Add your files
+**לא נדרש ידע טכני מוקדם** - הממשק נועד להיות אינטואיטיבי וקל לשימוש.
 
-- [ ] [Create](https://docs.gitlab.com/ee/user/project/repository/web_editor.html#create-a-file) or [upload](https://docs.gitlab.com/ee/user/project/repository/web_editor.html#upload-a-file) files
-- [ ] [Add files using the command line](https://docs.gitlab.com/topics/git/add_files/#add-files-to-a-git-repository) or push an existing Git repository with the following command:
+---
+
+## ✨ פיצ'רים מרכזיים
+
+### ✅ קיים ופעיל
+
+#### 1. 🖥️ שיתוף מסך מהיר ויעיל
+* **לכידה:** Windows.Graphics.Capture API - לכידת מסך ברזולוציה מלאה
+* **דחיסה:** H.264 (OpenH264) עם איכות מותאמת דינמית
+* **שידור:** UDP Sockets עם Packet Fragmentation
+* **ביצועים:** עד 30 FPS עם latency של 50-150ms
+
+
+#### 2. 🎚️ Adaptive Quality System
+מנגנון אינטליגנטי שמתאים את איכות השידור בזמן אמת על פי תנאי הרשת ורמת התנועה במסך:
+
+**Motion Detection חכם:**
+- 🟢 **Static** - תוכן סטטי (מסמכי טקסט, קוד)
+- 🟡 **Low Motion** - תנועה מועטה (גלישה באינטרנט)
+- 🟠 **Medium Motion** - תנועה בינונית (עבודה רגילה)
+- 🔴 **High Motion** - תנועה אינטנסיבית (וידאו, משחקים)
+
+**התאמות דינמיות:**
+- **Bitrate:** 0.8-10 Mbps (מותאם אוטומטית)
+- **FPS:** 10-30 FPS (משתנה לפי עומס)
+- **Smart Response:** מגיב רק לשינויים משמעותיים
+
+#### 3. 📦 Jitter Buffer מתקדם
+מנגנון אגירה בסגנון TWS (True Wireless Stereo) המטפל בבעיות רשת:
+
+**יכולות:**
+- ⏱️ **Packet Buffering:** אגירת חבילות עד 150ms למזעור השפעת jitter
+- 🔄 **Loss Recovery:** זיהוי אוטומטי של חבילות אבודות
+- 📨 **I-Frame Request:** בקשה אוטומטית ל-I-Frame במקרה של packet loss קריטי
+- 🔀 **Out-of-Order Handling:** טיפול בחבילות שמגיעות לא בסדר
+- 📊 **Real-time Statistics:** מעקב אחר packet loss, recovery rate, duplicates
+
+
+#### 4. 🖱️⌨️ שליטה מרחוק מלאה
+שליטה בזמן אמת על מחשב מרוחק עם תחושת שליטה מקומית:
+
+**Mouse Control:**
+- תנועה חלקה (60 updates/sec)
+- תמיכה בכל סוגי הלחיצות (Left/Right/Middle)
+- Drag & Drop
+- Mouse Wheel
+
+**Keyboard Control:**
+- תמיכה מלאה בכל המקשים
+- Modifier keys (Ctrl, Alt, Shift, Win)
+- תמיכה בקיצורי מקלדת מורכבים
+
+**מימוש טכני:**
+- Win32 API - `SendInput()` עם Global Hooks
+- Latency: ~50-100ms (תלוי ברשת)
+
+#### 5. 🔄 התאוששות מתקלות אוטומטית
+- **I-Frame Recovery:** בקשת I-Frame אוטומטית בעת packet loss משמעותי
+- **Connection Resilience:** המערכת ממשיכה לעבוד גם בתנאי רשת לא אידיאליים
+- **Graceful Degradation:** הורדת איכות אוטומטית לשמירה על חוויית משתמש
+
+### 🛠️ בתכנון
+
+- **שרת מרכזי:** ניהול חיבורים, אימות והרשאות
+- **NAT Traversal:** תמיכה ב-STUN/TURN לחיבור מחוץ לרשת המקומית
+- **שליטה סימולטנית:** מנוע "ממוצע תנועות" לשליטה של מספר משתמשים במקביל (בתהליך עבודה)
+- **ניהול הרשאות:** תפקידים - Admin, Viewer, Controller
+
+---
+
+## 🔧 ארכיטכטורה וטכנולוגיות
+
+### מבנה הפרויקט
 
 ```
-cd existing_repo
-git remote add origin https://gitlab.com/edengm157/krayot-02-remotix.git
-git branch -M main
-git push -uf origin main
+Remotix/
+├── Sender/                          # אפליקציית הצד המשדר
+│   ├── FrameCapturer.cs            # לכידת מסך
+│   ├── VideoEncoder.cs             # דחיסת H.264
+│   ├── AdaptiveQualityController.cs # אלגוריתם התאמת איכות
+│   ├── PerformanceMonitor.cs       # ניטור ביצועים + Motion Detection
+│   ├── InputReceiver.cs            # קבלת פקודות מרחוק וביצוען
+│   └── MainWindow.xaml             # ממשק משתמש WPF
+│
+├── Receiver/                        # אפליקציית הצד הצופה
+│   ├── FrameReceiver.cs            # קבלת וידאו + Jitter Buffer
+│   ├── VideoDecoder.cs             # פתיחת דחיסת H.264
+│   ├── InputSender.cs              # שליחת פקודות שליטה
+│   ├── InputLogger.cs              # לכידת מקלדת/עכבר
+│   └── ViewerWindow.xaml           # חלון הצפייה
+│
+└── Docs/                            # תיעוד ואפיון
 ```
 
-## Integrate with your tools
+### סטאק טכנולוגי
 
-- [ ] [Set up project integrations](https://gitlab.com/edengm157/krayot-02-remotix/-/settings/integrations)
+**שפות ופלטפורמות:**
+- 🔷 **C# 10.0** - שפת הפיתוח הראשית
+- 🎨 **WPF (Windows Presentation Foundation)** - ממשק משתמש
 
-## Collaborate with your team
+**וידאו:**
+- 📹 **Windows.Graphics.Capture** - לכידת מסך
+- 🎬 **SharpDX** - גישה ישירה לגרפיקה (Direct3D)
+- 🗜️ **H264Sharp** - Wrapper ל-OpenH264
 
-- [ ] [Invite team members and collaborators](https://docs.gitlab.com/ee/user/project/members/)
-- [ ] [Create a new merge request](https://docs.gitlab.com/ee/user/project/merge_requests/creating_merge_requests.html)
-- [ ] [Automatically close issues from merge requests](https://docs.gitlab.com/ee/user/project/issues/managing_issues.html#closing-issues-automatically)
-- [ ] [Enable merge request approvals](https://docs.gitlab.com/ee/user/project/merge_requests/approvals/)
-- [ ] [Set auto-merge](https://docs.gitlab.com/user/project/merge_requests/auto_merge/)
+**תקשורת:**
+- 🌐 **UDP Sockets** - פרוטוקול תקשורת ראשי
+  - פורט 12345: שידור וידאו
+  - פורט 12346: פקודות שליטה
+- 📦 **JSON** - פורמט העברת נתונים
 
-## Test and Deploy
+**קלט (Input Handling):**
+- ⌨️ **Win32 API** - `SetWindowsHookEx()` ללכידת Global Hooks
+- 🖱️ **SendInput()** - סימולציה של עכבר ומקלדת
 
-Use the built-in continuous integration in GitLab.
+---
 
-- [ ] [Get started with GitLab CI/CD](https://docs.gitlab.com/ee/ci/quick_start/)
-- [ ] [Analyze your code for known vulnerabilities with Static Application Security Testing (SAST)](https://docs.gitlab.com/ee/user/application_security/sast/)
-- [ ] [Deploy to Kubernetes, Amazon EC2, or Amazon ECS using Auto Deploy](https://docs.gitlab.com/ee/topics/autodevops/requirements.html)
-- [ ] [Use pull-based deployments for improved Kubernetes management](https://docs.gitlab.com/ee/user/clusters/agent/)
-- [ ] [Set up protected environments](https://docs.gitlab.com/ee/ci/environments/protected_environments.html)
+## ⚡ ביצועים ומפרטים טכניים
 
-***
+### נתוני ביצועים
 
-# Editing this README
+| מדד | ערך | הערות |
+|-----|-----|-------|
+| **Latency** | 50-150ms | תלוי באיכות הרשת |
+| **FPS** | 10-30 | מותאם דינמית |
+| **Bitrate** | 0.8-10 Mbps | משתנה לפי Motion Level |
+| **Resolution** | עד 1920×1080 | תומך בכל רזולוציה |
+| **Packet Loss Recovery** | 85-95% | Recovery rate ממוצע |
+| **Input Latency** | ~50ms | עכבר + מקלדת |
+| **CPU Usage** | 15-40% | תלוי ברזולוציה ו-FPS |
 
-When you're ready to make this README your own, just edit this file and use the handy template below (or feel free to structure it however you want - this is just a starting point!). Thanks to [makeareadme.com](https://www.makeareadme.com/) for this template.
 
-## Suggestions for a good README
+---
 
-Every project is different, so consider which of these sections apply to yours. The sections used in the template are suggestions for most open source projects. Also keep in mind that while a README can be too long and detailed, too long is better than too short. If you think your README is too long, consider utilizing another form of documentation rather than cutting out information.
+## ⚠️ מגבלות ידועות
 
-## Name
-Choose a self-explaining name for your project.
+1. **🌐 רשת מקומית בלבד**
+   - דורש IP ישיר (אין NAT Traversal)
+   - לא תומך בחיבור דרך האינטרנט ללא Port Forwarding
 
-## Description
-Let people know what your project can do specifically. Provide context and add a link to any reference visitors might be unfamiliar with. A list of Features or a Background subsection can also be added here. If there are alternatives to your project, this is a good place to list differentiating factors.
+2. **🪟 Windows בלבד**
+   - תלוי ב-Windows.Graphics.Capture API
+   - לא תומך ב-Linux/macOS
 
-## Badges
-On some READMEs, you may see small images that convey metadata, such as whether or not all the tests are passing for the project. You can use Shields to add some to your README. Many services also have instructions for adding a badge.
+3. **📡 תקשורת UDP**
+   - חבילות אבודות עלולות לגרום לקפיצות בווידאו
+   - ה-Jitter Buffer ממזער את הבעיה אך לא פותר לחלוטין
 
-## Visuals
-Depending on what you are making, it can be a good idea to include screenshots or even a video (you'll frequently see GIFs rather than actual videos). Tools like ttygif can help, but check out Asciinema for a more sophisticated method.
+4. **🎬 H.264 בלבד**
+   - תלוי ב-OpenH264 DLL
+   - אין תמיכה בקודקים אחרים
 
-## Installation
-Within a particular ecosystem, there may be a common way of installing things, such as using Yarn, NuGet, or Homebrew. However, consider the possibility that whoever is reading your README is a novice and would like more guidance. Listing specific steps helps remove ambiguity and gets people to using your project as quickly as possible. If it only runs in a specific context like a particular programming language version or operating system or has dependencies that have to be installed manually, also add a Requirements subsection.
+5. **👤 משתמש יחיד**
+   - כרגע תומך רק ב-1:1 (צופה אחד)
+   - שליטה סימולטנית עכשיו בתהליך עבודה
 
-## Usage
-Use examples liberally, and show the expected output if you can. It's helpful to have inline the smallest example of usage that you can demonstrate, while providing links to more sophisticated examples if they are too long to reasonably include in the README.
+6. **🔒 אבטחה בסיסית**
+   - אין הצפנה של תעבורת הרשת
+   - אין אימות משתמשים בנתיים
 
-## Support
-Tell people where they can go to for help. It can be any combination of an issue tracker, a chat room, an email address, etc.
+---
 
-## Roadmap
-If you have ideas for releases in the future, it is a good idea to list them in the README.
+## 📊 השוואה לפתרונות קיימים
 
-## Contributing
-State if you are open to contributions and what your requirements are for accepting them.
+| פיצ'ר | Remotix | TeamViewer | AnyDesk | RustDesk | Chrome Remote |
+|-------|---------|------------|---------|----------|---------------|
+| **שליטה סימולטנית** | 🔜 | ❌ | ❌ | ❌ | ❌ |
+| **Latency** | 50-150ms | 30-100ms | 30-80ms | 50-120ms | 100-200ms |
+| **NAT Traversal** | 🔜 | ✅ | ✅ | ✅ | ✅ |
+| **שרת פרטי** | 🔜 | ❌ | ❌ | ✅ | ❌ |
+| **Adaptive Quality** | ✅ | ✅ | ✅ | ⚠️ בסיסי | ⚠️ בסיסי |
+| **Multi-platform** | ❌ | ✅ | ✅ | ✅ | ✅ |
 
-For people who want to make changes to your project, it's helpful to have some documentation on how to get started. Perhaps there is a script that they should run or some environment variables that they need to set. Make these steps explicit. These instructions could also be useful to your future self.
+**מקורות:**
+- [TeamViewer](https://www.teamviewer.com)
+- [AnyDesk](https://anydesk.com)
+- [RustDesk](https://github.com/rustdesk/rustdesk)
+- [Chrome Remote Desktop](https://remotedesktop.google.com)
 
-You can also document commands to lint the code or run tests. These steps help to ensure high code quality and reduce the likelihood that the changes inadvertently break something. Having instructions for running tests is especially helpful if it requires external setup, such as starting a Selenium server for testing in a browser.
+---
 
-## Authors and acknowledgment
-Show your appreciation to those who have contributed to the project.
+## ⚙️ הגדרות חיבור (זמני - עד להוספת GUI להגדרות)
 
-## License
-For open source projects, say how it is licensed.
+### הגדרת Sender (הצד המשדר)
 
-## Project status
-If you have run out of energy or time for your project, put a note at the top of the README saying that development has slowed down or stopped completely. Someone may choose to fork your project or volunteer to step in as a maintainer or owner, allowing your project to keep going. You can also make an explicit request for maintainers.
+**קובץ:** `Sender/FrameCapturer.cs`
+
+```csharp
+// שורה 42 (בקירוב)
+private const string RECEIVER_IP = "192.168.1.100";  // שנה לIP של המקבל
+private const int VIDEO_PORT = 12345;
+private const int CONTROL_PORT = 12346;
+```
+
+**איך למצוא את ה-IP של המקבל:**
+1. במחשב המקבל, פתח Command Prompt (Win+R → `cmd`)
+2. הקלד: `ipconfig`
+3. חפש את ה-IPv4 Address (למשל: `192.168.1.100`)
+
+---
+
+### הגדרת Receiver (הצד המקבל)
+
+**קובץ:** `Receiver/InputSender.cs`
+
+```csharp
+// שורה 38 (בקירוב)
+private const string SENDER_IP = "192.168.1.50";  // IP של המשדר
+private const int CONTROL_PORT = 12346;
+```
+
+**הערה:** ה-Receiver גם מאזין לפורט 12345 לקבלת הוידאו, אין צורך להגדיר.
+
+---
+
+### טיפים חשובים:
+
+⚠️ **Firewall:** ודא ש-Windows Firewall מאפשר את הפורטים 12345 ו-12346  
+⚠️ **אותה רשת:** שני המחשבים חייבים להיות באותה רשת מקומית  
+⚠️ **OpenH264.dll:** הקובץ חייב להיות בתיקיית ה-Build של שני הפרויקטים
+
+---
+
+## 🧪 בדיקות שבוצעו
+
+### בדיקות ידניות:
+
+✅ **לכידת מסך:**
+- רזולוציה: 1920×1080, 1366×768, 1280×720
+- תוכן סטטי: מסמכי Word, עורך קוד
+- תנועה גבוהה: וידאו YouTube, משחקים
+
+✅ **שליטה מרחוק:**
+- תנועת עכבר: חלקה וללא שיהוי משמעותי
+- לחיצות: Left/Right/Middle - עובד
+- מקלדת: כל המקשים + modifiers
+- Drag & Drop: עובד
+
+✅ **תנאי רשת:**
+- LAN (1 Gbps): מושלם
+- WiFi (100 Mbps): טוב מאוד
+- WiFi (10 Mbps): סביר (FPS נופל ל-15)
+- Packet Loss 5%: Jitter Buffer מתמודד
+- Packet Loss 15%: נראים artifacts, אך עובד
+
+✅ **ביצועים:**
+- CPU: 15-40% (תלוי ברזולוציה)
+- RAM: ~200MB
+- Network: 2-8 Mbps (תלוי ב-Motion Level)
+
+---
+
+## 👥 הצוות
+
+**מפתחים:**
+- **רומה צ'וחננקו**
+- **עדן גנד מאור**
+
+**הנחיה:**
+- **צחי לוי** - מנטור
+- **ישי יולזרי** - ראש צוות
+
+**מסגרת:**
+- תוכנית "מגשימים" 2025-2026
+- כיתה י"ב, קריות
+
+---
+
+<div align="center">
+
+**נבנה ע"י תלמידי תוכנית מגשימים סייבר**
+
+</div>
