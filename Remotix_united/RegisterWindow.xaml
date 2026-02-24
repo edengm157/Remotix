@@ -1,0 +1,49 @@
+﻿<Window x:Class="RemotixApp.RegisterWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Register" Height="550" Width="400"
+        WindowStartupLocation="CenterScreen"
+        WindowStyle="None" AllowsTransparency="True" Background="Transparent">
+
+	<Border CornerRadius="20" Background="#1F2937">
+		<Border.Effect>
+			<DropShadowEffect BlurRadius="30" ShadowDepth="10" Opacity="0.5"/>
+		</Border.Effect>
+
+		<Grid Margin="40">
+			<StackPanel VerticalAlignment="Center">
+				<TextBlock Text="Create Account" Foreground="White" FontSize="28" FontWeight="Bold" HorizontalAlignment="Center" Margin="0,0,0,30"/>
+
+				<TextBlock Text="USERNAME" Foreground="#9CA3AF" FontSize="10" FontWeight="Bold" Margin="0,0,0,5"/>
+				<Border Background="#374151" CornerRadius="8" Height="40" Margin="0,0,0,15">
+					<TextBox x:Name="RegUsernameTextBox" Background="Transparent" BorderThickness="0" Foreground="White" 
+                             VerticalContentAlignment="Center" Padding="10,0" FontSize="14" CaretBrush="White"/>
+				</Border>
+
+				<TextBlock Text="PASSWORD" Foreground="#9CA3AF" FontSize="10" FontWeight="Bold" Margin="0,0,0,5"/>
+				<Border Background="#374151" CornerRadius="8" Height="40" Margin="0,0,0,15">
+					<PasswordBox x:Name="RegPasswordBox" Background="Transparent" BorderThickness="0" Foreground="White" 
+                                 VerticalContentAlignment="Center" Padding="10,0" FontSize="14" CaretBrush="White"/>
+				</Border>
+
+				<TextBlock Text="CONFIRM PASSWORD" Foreground="#9CA3AF" FontSize="10" FontWeight="Bold" Margin="0,0,0,5"/>
+				<Border Background="#374151" CornerRadius="8" Height="40" Margin="0,0,0,25">
+					<PasswordBox x:Name="ConfirmPasswordBox" Background="Transparent" BorderThickness="0" Foreground="White" 
+                                 VerticalContentAlignment="Center" Padding="10,0" FontSize="14" CaretBrush="White"/>
+				</Border>
+
+				<Button x:Name="RegisterButton" Content="SIGN UP" Height="45" Background="#10B981" Foreground="White" FontSize="14" FontWeight="Bold"
+                        BorderThickness="0" Cursor="Hand">
+					<Button.Resources>
+						<Style TargetType="Border">
+							<Setter Property="CornerRadius" Value="8"/>
+						</Style>
+					</Button.Resources>
+				</Button>
+
+				<Button x:Name="BackToLoginButton" Content="Already registered? Log in" Background="Transparent" Foreground="#60A5FA" 
+                        BorderThickness="0" Margin="0,15,0,0" Cursor="Hand" FontSize="12"/>
+			</StackPanel>
+		</Grid>
+	</Border>
+</Window>

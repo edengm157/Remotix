@@ -1,0 +1,132 @@
+<Window x:Class="RemotixApp.ReceiverWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Remotix Receiver" Height="750" Width="1000"
+        WindowStartupLocation="CenterScreen"
+        Background="#0F172A">
+
+	<Window.Resources>
+		<Style x:Key="MetricCard" TargetType="Border">
+			<Setter Property="Background" Value="#1E293B"/>
+			<Setter Property="CornerRadius" Value="12"/>
+			<Setter Property="Padding" Value="15"/>
+			<Setter Property="Margin" Value="5"/>
+		</Style>
+		<Style x:Key="MetricLabel" TargetType="TextBlock">
+			<Setter Property="Foreground" Value="#94A3B8"/>
+			<Setter Property="FontSize" Value="11"/>
+			<Setter Property="FontWeight" Value="Bold"/>
+			<Setter Property="TextAlignment" Value="Center"/>
+		</Style>
+		<Style x:Key="MetricValue" TargetType="TextBlock">
+			<Setter Property="Foreground" Value="#F8FAFC"/>
+			<Setter Property="FontSize" Value="24"/>
+			<Setter Property="FontWeight" Value="Bold"/>
+		</Style>
+	</Window.Resources>
+
+	<Grid Margin="20">
+		<Grid.RowDefinitions>
+			<RowDefinition Height="Auto"/>
+			<RowDefinition Height="Auto"/>
+			<RowDefinition Height="*"/>
+			<RowDefinition Height="Auto"/>
+		</Grid.RowDefinitions>
+
+		<Grid Grid.Row="0" Margin="0,0,0,20">
+			<Grid.ColumnDefinitions>
+				<ColumnDefinition Width="*"/>
+				<ColumnDefinition Width="Auto"/>
+			</Grid.ColumnDefinitions>
+
+			<StackPanel VerticalAlignment="Center">
+				<TextBlock Text="Remote View" Foreground="White" FontSize="22" FontWeight="Bold"/>
+				<TextBlock x:Name="StatusText" Text="Ready to connect" Foreground="#3B82F6" FontSize="14" Margin="0,5,0,0"/>
+			</StackPanel>
+
+			<StackPanel Grid.Column="1" Orientation="Horizontal">
+				<Button x:Name="StartButton" Click="StartButton_Click" Content="▶ CONNECT" Width="120" Height="40" 
+                        Background="#3B82F6" Foreground="White" FontWeight="Bold" BorderThickness="0" Margin="5">
+					<Button.Resources>
+						<Style TargetType="Border">
+							<Setter Property="CornerRadius" Value="8"/>
+						</Style>
+					</Button.Resources>
+				</Button>
+				<Button x:Name="StopButton" Click="StopButton_Click" Content="⏹ DISCONNECT" Width="120" Height="40" 
+                        Background="#EF4444" Foreground="White" FontWeight="Bold" BorderThickness="0" Margin="5" IsEnabled="False">
+					<Button.Resources>
+						<Style TargetType="Border">
+							<Setter Property="CornerRadius" Value="8"/>
+						</Style>
+					</Button.Resources>
+				</Button>
+			</StackPanel>
+		</Grid>
+
+		<UniformGrid Grid.Row="1" Columns="6" Margin="0,0,0,20">
+			<Border Style="{StaticResource MetricCard}">
+				<StackPanel>
+					<TextBlock Text="Decode FPS" Style="{StaticResource MetricLabel}"/>
+					<StackPanel Orientation="Horizontal" Margin="0,5,0,0">
+						<TextBlock x:Name="FpsText" Text="0.0" Style="{StaticResource MetricValue}"/>
+						<TextBlock Text=" fps" Foreground="#64748B" FontSize="12" VerticalAlignment="Bottom" Margin="4,0,0,4"/>
+					</StackPanel>
+				</StackPanel>
+			</Border>
+
+			<Border Style="{StaticResource MetricCard}">
+				<StackPanel>
+					<TextBlock Text="Bitrate" Style="{StaticResource MetricLabel}"/>
+					<StackPanel Orientation="Horizontal" Margin="0,5,0,0">
+						<TextBlock x:Name="BitrateText" Text="0.0" Style="{StaticResource MetricValue}"/>
+						<TextBlock Text=" Mbps" Foreground="#64748B" FontSize="12" VerticalAlignment="Bottom" Margin="4,0,0,4"/>
+					</StackPanel>
+				</StackPanel>
+			</Border>
+
+			<Border Style="{StaticResource MetricCard}">
+				<StackPanel>
+					<TextBlock Text="Decode Time" Style="{StaticResource MetricLabel}"/>
+					<StackPanel Orientation="Horizontal" Margin="0,5,0,0">
+						<TextBlock x:Name="LatencyText" Text="0" Style="{StaticResource MetricValue}"/>
+						<TextBlock Text=" ms" Foreground="#64748B" FontSize="12" VerticalAlignment="Bottom" Margin="4,0,0,4"/>
+					</StackPanel>
+				</StackPanel>
+			</Border>
+
+			<Border Style="{StaticResource MetricCard}">
+				<StackPanel>
+					<TextBlock Text="Packet Loss" Style="{StaticResource MetricLabel}"/>
+					<StackPanel Orientation="Horizontal" Margin="0,5,0,0">
+						<TextBlock x:Name="PacketLossText" Text="0.0" Style="{StaticResource MetricValue}" Foreground="#F59E0B"/>
+						<TextBlock Text=" %" Foreground="#64748B" FontSize="12" VerticalAlignment="Bottom" Margin="4,0,0,4"/>
+					</StackPanel>
+				</StackPanel>
+			</Border>
+
+			<Border Style="{StaticResource MetricCard}">
+				<StackPanel>
+					<TextBlock Text="Total Frames" Style="{StaticResource MetricLabel}"/>
+					<TextBlock x:Name="TotalFramesText" Text="0" Style="{StaticResource MetricValue}"/>
+				</StackPanel>
+			</Border>
+
+			<Border Style="{StaticResource MetricCard}">
+				<StackPanel>
+					<TextBlock Text="Quality" Style="{StaticResource MetricLabel}"/>
+					<TextBlock x:Name="QualityIndicator" Text="🟢" FontSize="24" Margin="0,5,0,0"/>
+				</StackPanel>
+			</Border>
+		</UniformGrid>
+
+		<Border Grid.Row="2" Background="Black" CornerRadius="12" BorderBrush="#334155" BorderThickness="1" ClipToBounds="True">
+			<Viewbox Stretch="Uniform">
+				<Image x:Name="DisplayImage" Stretch="Uniform" StretchDirection="Both" RenderOptions.BitmapScalingMode="HighQuality"/>
+			</Viewbox>
+		</Border>
+
+		<TextBlock Grid.Row="3" Text="Remotix Receiver v2.0" Foreground="#475569" 
+                   FontSize="12" HorizontalAlignment="Center" Margin="0,10,0,0"/>
+	</Grid>
+</Window>

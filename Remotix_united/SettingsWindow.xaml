@@ -1,0 +1,38 @@
+﻿<Window x:Class="RemotixApp.SettingsWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Settings" Height="300" Width="500"
+        WindowStartupLocation="CenterScreen"
+        Background="#111827">
+
+	<Grid Margin="30">
+		<Grid.RowDefinitions>
+			<RowDefinition Height="Auto"/>
+			<RowDefinition Height="*"/>
+			<RowDefinition Height="Auto"/>
+		</Grid.RowDefinitions>
+
+		<TextBlock Text="Connection Settings" Foreground="White" FontSize="24" FontWeight="Bold"/>
+
+		<StackPanel Grid.Row="1" VerticalAlignment="Center">
+			<TextBlock Text="MY IP ADDRESS" Foreground="#9CA3AF" FontSize="12" FontWeight="Bold" Margin="0,0,0,8"/>
+			<Border Background="#374151" CornerRadius="8" Height="50">
+				<TextBox x:Name="IpAddressTextBox" Background="Transparent" BorderThickness="0" 
+                         Foreground="White" FontSize="16" VerticalContentAlignment="Center" Padding="15,0" CaretBrush="White"/>
+			</Border>
+			<TextBlock Text="Enter the local IP address of your computer you conced form." 
+                       Foreground="#6B7280" FontSize="12" Margin="0,8,0,0"/>
+		</StackPanel>
+
+		<StackPanel Grid.Row="2" Orientation="Horizontal" HorizontalAlignment="Right">
+			<Button x:Name="SaveSettingsButton" Content="SAVE &amp; CLOSE" Width="150" Height="40" 
+                    Background="#3B82F6" Foreground="White" FontWeight="Bold" BorderThickness="0" Cursor="Hand">
+				<Button.Resources>
+					<Style TargetType="Border">
+						<Setter Property="CornerRadius" Value="8"/>
+					</Style>
+				</Button.Resources>
+			</Button>
+		</StackPanel>
+	</Grid>
+</Window>
